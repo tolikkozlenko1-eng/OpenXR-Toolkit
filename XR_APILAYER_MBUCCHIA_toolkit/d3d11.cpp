@@ -1539,6 +1539,26 @@ void main(uint3 id : SV_DispatchThreadID)
             m_copyTextureEvent = event;
         }
 
+        void registerSetViewportEvent(SetViewportEvent event) override {
+            m_setViewportEvent = event;
+        }
+
+        void registerBeforeDrawEvent(BeforeDrawEvent event) override {
+            m_beforeDrawEvent = event;
+        }
+
+        void registerBeforeExecuteEvent(BeforeExecuteEvent event) override {
+            m_beforeExecuteEvent = event;
+        }
+
+        void setPendingVrsLatch() override {
+            m_pendingVrsLatch.store(true, std::memory_order_relaxed);
+        }
+
+        void clearPendingVrsLatch() override {
+            m_pendingVrsLatch.store(false, std::memory_order_relaxed);
+        }
+
         void getVRAMUsage(uint64_t& usage, uint8_t& percentUsed) const {
             utilities::GetVRAMUsage(m_adapter, usage, percentUsed);
         }
@@ -1603,6 +1623,14 @@ void main(uint3 id : SV_DispatchThreadID)
 
             g_instance = this;
 
+            // ID3D11Device inherits IUnknown only, so CreateVertexShader is vtable slot 12.
+            // Context slot 12 is DrawIndexed. This has to be the device that owns the
+            // context the draw hook already sees, or the shader pointer will not match.
+            DetourMethodAttach(get(m_device),
+                               12,
+                               hooked_ID3D11Device_CreateVertexShader,
+                               g_original_ID3D11Device_CreateVertexShader);
+
             // Hook to the Direct3D device context to intercept preparation for the rendering.
             DetourMethodAttach(get(m_context),
                                // Method offset is 7 + method index (0-based) for ID3D11DeviceContext.
@@ -1634,6 +1662,130 @@ void main(uint3 id : SV_DispatchThreadID)
                                10,
                                hooked_ID3D11DeviceContext_PSSetSamplers,
                                g_original_ID3D11DeviceContext_PSSetSamplers);
+            // 7 + DrawIndexed/Draw/DrawIndexedInstanced/DrawInstanced. The rate is latched here,
+            // immediately before the pixels are shaded.
+            DetourMethodAttach(get(m_context),
+                               12,
+                               hooked_ID3D11DeviceContext_DrawIndexed,
+                               g_original_ID3D11DeviceContext_DrawIndexed);
+            DetourMethodAttach(get(m_context),
+                               13,
+                               hooked_ID3D11DeviceContext_Draw,
+                               g_original_ID3D11DeviceContext_Draw);
+            DetourMethodAttach(get(m_context),
+                               20,
+                               hooked_ID3D11DeviceContext_DrawIndexedInstanced,
+                               g_original_ID3D11DeviceContext_DrawIndexedInstanced);
+            DetourMethodAttach(get(m_context),
+                               21,
+                               hooked_ID3D11DeviceContext_DrawInstanced,
+                               g_original_ID3D11DeviceContext_DrawInstanced);
+            // DrawAuto and the indirect draws. Elite's scene draws go through these.
+            DetourMethodAttach(get(m_context),
+                               38,
+                               hooked_ID3D11DeviceContext_DrawAuto,
+                               g_original_ID3D11DeviceContext_DrawAuto);
+            DetourMethodAttach(get(m_context),
+                               39,
+                               hooked_ID3D11DeviceContext_DrawIndexedInstancedIndirect,
+                               g_original_ID3D11DeviceContext_DrawIndexedInstancedIndirect);
+            DetourMethodAttach(get(m_context),
+                               40,
+                               hooked_ID3D11DeviceContext_DrawInstancedIndirect,
+                               g_original_ID3D11DeviceContext_DrawInstancedIndirect);
+            // Slot 58 is ExecuteCommandList. The recorded eye pass runs here.
+            DetourMethodAttach(get(m_context),
+                               58,
+                               hooked_ID3D11DeviceContext_ExecuteCommandList,
+                               g_original_ID3D11DeviceContext_ExecuteCommandList);
+
+            // Elite records the eye pass on a deferred context. That class has its own vtable, so the
+            // immediate-context detour above never sees those OMSetRenderTargets calls.
+            ComPtr<ID3D11DeviceContext> deferredContext;
+            if (SUCCEEDED(m_device->CreateDeferredContext(0, deferredContext.ReleaseAndGetAddressOf())) &&
+                deferredContext) {
+                LPVOID* immediateVtable = *reinterpret_cast<LPVOID**>(get(m_context));
+                LPVOID* deferredVtable = *reinterpret_cast<LPVOID**>(deferredContext.Get());
+                attachDeferredMethod(immediateVtable,
+                                     deferredVtable,
+                                     33,
+                                     hooked_Deferred_OMSetRenderTargets,
+                                     g_original_Deferred_OMSetRenderTargets,
+                                     "OMSetRenderTargets");
+                attachDeferredMethod(immediateVtable,
+                                     deferredVtable,
+                                     34,
+                                     hooked_Deferred_OMSetRenderTargetsAndUnorderedAccessViews,
+                                     g_original_Deferred_OMSetRenderTargetsAndUnorderedAccessViews,
+                                     "OMSetRenderTargetsAndUnorderedAccessViews");
+                attachDeferredMethod(immediateVtable,
+                                     deferredVtable,
+                                     44,
+                                     hooked_Deferred_RSSetViewports,
+                                     g_original_Deferred_RSSetViewports,
+                                     "RSSetViewports");
+                attachDeferredMethod(immediateVtable,
+                                     deferredVtable,
+                                     12,
+                                     hooked_Deferred_DrawIndexed,
+                                     g_original_Deferred_DrawIndexed,
+                                     "DrawIndexed");
+                attachDeferredMethod(immediateVtable,
+                                     deferredVtable,
+                                     13,
+                                     hooked_Deferred_Draw,
+                                     g_original_Deferred_Draw,
+                                     "Draw");
+                attachDeferredMethod(immediateVtable,
+                                     deferredVtable,
+                                     20,
+                                     hooked_Deferred_DrawIndexedInstanced,
+                                     g_original_Deferred_DrawIndexedInstanced,
+                                     "DrawIndexedInstanced");
+                attachDeferredMethod(immediateVtable,
+                                     deferredVtable,
+                                     21,
+                                     hooked_Deferred_DrawInstanced,
+                                     g_original_Deferred_DrawInstanced,
+                                     "DrawInstanced");
+                attachDeferredMethod(immediateVtable,
+                                     deferredVtable,
+                                     38,
+                                     hooked_Deferred_DrawAuto,
+                                     g_original_Deferred_DrawAuto,
+                                     "DrawAuto");
+                attachDeferredMethod(immediateVtable,
+                                     deferredVtable,
+                                     39,
+                                     hooked_Deferred_DrawIndexedInstancedIndirect,
+                                     g_original_Deferred_DrawIndexedInstancedIndirect,
+                                     "DrawIndexedInstancedIndirect");
+                attachDeferredMethod(immediateVtable,
+                                     deferredVtable,
+                                     40,
+                                     hooked_Deferred_DrawInstancedIndirect,
+                                     g_original_Deferred_DrawInstancedIndirect,
+                                     "DrawInstancedIndirect");
+            } else {
+                Log("D3D11 CreateDeferredContext failed; eye passes on a deferred context will not get VRS\n");
+            }
+        }
+
+        template <typename TMethod>
+        void attachDeferredMethod(LPVOID* immediateVtable,
+                                  LPVOID* deferredVtable,
+                                  unsigned int slot,
+                                  TMethod hooked,
+                                  TMethod& original,
+                                  const char* name) {
+            auto deferredMethod = reinterpret_cast<TMethod>(deferredVtable[slot]);
+            auto immediateMethod = reinterpret_cast<TMethod>(immediateVtable[slot]);
+            if (!deferredMethod || deferredMethod == immediateMethod) {
+                Log("D3D11 deferred %s is shared with the immediate context\n", name);
+                return;
+            }
+            Log("D3D11 deferred %s is a separate method\n", name);
+            DetourFunctionAttach(deferredMethod, hooked, original);
         }
 
         void uninitializeInterceptor() {
@@ -1662,6 +1814,88 @@ void main(uint3 id : SV_DispatchThreadID)
                                10,
                                hooked_ID3D11DeviceContext_PSSetSamplers,
                                g_original_ID3D11DeviceContext_PSSetSamplers);
+            DetourMethodDetach(get(m_context),
+                               12,
+                               hooked_ID3D11DeviceContext_DrawIndexed,
+                               g_original_ID3D11DeviceContext_DrawIndexed);
+            DetourMethodDetach(get(m_context),
+                               13,
+                               hooked_ID3D11DeviceContext_Draw,
+                               g_original_ID3D11DeviceContext_Draw);
+            DetourMethodDetach(get(m_context),
+                               20,
+                               hooked_ID3D11DeviceContext_DrawIndexedInstanced,
+                               g_original_ID3D11DeviceContext_DrawIndexedInstanced);
+            DetourMethodDetach(get(m_context),
+                               21,
+                               hooked_ID3D11DeviceContext_DrawInstanced,
+                               g_original_ID3D11DeviceContext_DrawInstanced);
+            DetourMethodDetach(get(m_context),
+                               38,
+                               hooked_ID3D11DeviceContext_DrawAuto,
+                               g_original_ID3D11DeviceContext_DrawAuto);
+            DetourMethodDetach(get(m_context),
+                               39,
+                               hooked_ID3D11DeviceContext_DrawIndexedInstancedIndirect,
+                               g_original_ID3D11DeviceContext_DrawIndexedInstancedIndirect);
+            DetourMethodDetach(get(m_context),
+                               40,
+                               hooked_ID3D11DeviceContext_DrawInstancedIndirect,
+                               g_original_ID3D11DeviceContext_DrawInstancedIndirect);
+            DetourMethodDetach(get(m_context),
+                               58,
+                               hooked_ID3D11DeviceContext_ExecuteCommandList,
+                               g_original_ID3D11DeviceContext_ExecuteCommandList);
+            if (g_original_Deferred_OMSetRenderTargets) {
+                DetourFunctionDetach(g_original_Deferred_OMSetRenderTargets,
+                                     hooked_Deferred_OMSetRenderTargets,
+                                     g_original_Deferred_OMSetRenderTargets);
+            }
+            if (g_original_Deferred_OMSetRenderTargetsAndUnorderedAccessViews) {
+                DetourFunctionDetach(g_original_Deferred_OMSetRenderTargetsAndUnorderedAccessViews,
+                                     hooked_Deferred_OMSetRenderTargetsAndUnorderedAccessViews,
+                                     g_original_Deferred_OMSetRenderTargetsAndUnorderedAccessViews);
+            }
+            if (g_original_Deferred_RSSetViewports) {
+                DetourFunctionDetach(g_original_Deferred_RSSetViewports,
+                                     hooked_Deferred_RSSetViewports,
+                                     g_original_Deferred_RSSetViewports);
+            }
+            if (g_original_Deferred_DrawIndexed) {
+                DetourFunctionDetach(
+                    g_original_Deferred_DrawIndexed, hooked_Deferred_DrawIndexed, g_original_Deferred_DrawIndexed);
+            }
+            if (g_original_Deferred_Draw) {
+                DetourFunctionDetach(g_original_Deferred_Draw, hooked_Deferred_Draw, g_original_Deferred_Draw);
+            }
+            if (g_original_Deferred_DrawIndexedInstanced) {
+                DetourFunctionDetach(g_original_Deferred_DrawIndexedInstanced,
+                                     hooked_Deferred_DrawIndexedInstanced,
+                                     g_original_Deferred_DrawIndexedInstanced);
+            }
+            if (g_original_Deferred_DrawInstanced) {
+                DetourFunctionDetach(g_original_Deferred_DrawInstanced,
+                                     hooked_Deferred_DrawInstanced,
+                                     g_original_Deferred_DrawInstanced);
+            }
+            if (g_original_Deferred_DrawAuto) {
+                DetourFunctionDetach(
+                    g_original_Deferred_DrawAuto, hooked_Deferred_DrawAuto, g_original_Deferred_DrawAuto);
+            }
+            if (g_original_Deferred_DrawIndexedInstancedIndirect) {
+                DetourFunctionDetach(g_original_Deferred_DrawIndexedInstancedIndirect,
+                                     hooked_Deferred_DrawIndexedInstancedIndirect,
+                                     g_original_Deferred_DrawIndexedInstancedIndirect);
+            }
+            if (g_original_Deferred_DrawInstancedIndirect) {
+                DetourFunctionDetach(g_original_Deferred_DrawInstancedIndirect,
+                                     hooked_Deferred_DrawInstancedIndirect,
+                                     g_original_Deferred_DrawInstancedIndirect);
+            }
+            DetourMethodDetach(get(m_device),
+                               12,
+                               hooked_ID3D11Device_CreateVertexShader,
+                               g_original_ID3D11Device_CreateVertexShader);
 
             g_instance = nullptr;
         }
@@ -1879,6 +2113,55 @@ void main(uint3 id : SV_DispatchThreadID)
             INVOKE_EVENT(setRenderTargetEvent, wrappedContext, renderTarget);
         }
 
+        void onSetViewports(ID3D11DeviceContext* context) {
+            if (m_blockEvents || !m_setViewportEvent) {
+                return;
+            }
+
+            ComPtr<ID3D11Device> device;
+            context->GetDevice(set(device));
+            if (device != m_device) {
+                return;
+            }
+
+            auto wrappedContext = std::make_shared<D3D11Context>(shared_from_this(), context);
+            blockCallbacks();
+            m_setViewportEvent(wrappedContext);
+            unblockCallbacks();
+        }
+
+        void onBeforeExecute(ID3D11DeviceContext* context) {
+            if (m_blockEvents || !m_beforeExecuteEvent || !context) {
+                return;
+            }
+
+            ComPtr<ID3D11Device> device;
+            context->GetDevice(set(device));
+            if (device != m_device) {
+                return;
+            }
+
+            blockCallbacks();
+            m_beforeExecuteEvent(context);
+            unblockCallbacks();
+        }
+
+        void onBeforeDraw(ID3D11DeviceContext* context, UINT primitiveCount = 0) {
+            if (m_blockEvents || !m_beforeDrawEvent) {
+                return;
+            }
+
+            ComPtr<ID3D11Device> device;
+            context->GetDevice(set(device));
+            if (device != m_device) {
+                return;
+            }
+
+            blockCallbacks();
+            m_beforeDrawEvent(context, primitiveCount);
+            unblockCallbacks();
+        }
+
         void onCopyResource(ID3D11DeviceContext* context,
                             ID3D11Resource* pSrcResource,
                             ID3D11Resource* pDstResource,
@@ -2032,6 +2315,10 @@ void main(uint3 id : SV_DispatchThreadID)
         SetRenderTargetEvent m_setRenderTargetEvent;
         UnsetRenderTargetEvent m_unsetRenderTargetEvent;
         CopyTextureEvent m_copyTextureEvent;
+        SetViewportEvent m_setViewportEvent;
+        BeforeDrawEvent m_beforeDrawEvent;
+        BeforeExecuteEvent m_beforeExecuteEvent;
+        std::atomic<bool> m_pendingVrsLatch{false};
         std::atomic<bool> m_blockEvents{false};
 
         ComPtr<ID3D11ComputeShader> m_debugWorkloadShader;
@@ -2090,6 +2377,23 @@ void main(uint3 id : SV_DispatchThreadID)
         // - D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT (8)
 
         static inline void* const kClearResources[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT] = {nullptr};
+
+        DECLARE_DETOUR_FUNCTION(static HRESULT,
+                                STDMETHODCALLTYPE,
+                                ID3D11Device_CreateVertexShader,
+                                ID3D11Device* Device,
+                                const void* pShaderBytecode,
+                                SIZE_T BytecodeLength,
+                                ID3D11ClassLinkage* pClassLinkage,
+                                ID3D11VertexShader** ppVertexShader) {
+            assert(g_original_ID3D11Device_CreateVertexShader);
+            const HRESULT hr = g_original_ID3D11Device_CreateVertexShader(
+                Device, pShaderBytecode, BytecodeLength, pClassLinkage, ppVertexShader);
+            if (SUCCEEDED(hr) && ppVertexShader && *ppVertexShader) {
+                noteEliteUiVertexShader(*ppVertexShader, pShaderBytecode, BytecodeLength);
+            }
+            return hr;
+        }
 
         DECLARE_DETOUR_FUNCTION(static void,
                                 STDMETHODCALLTYPE,
@@ -2190,7 +2494,280 @@ void main(uint3 id : SV_DispatchThreadID)
             assert(g_original_ID3D11DeviceContext_RSSetViewports);
             g_original_ID3D11DeviceContext_RSSetViewports(Context, NumViewports, pViewports);
 
+            if (g_instance) {
+                g_instance->onSetViewports(Context);
+            }
+
             TraceLoggingWriteStop(local, "ID3D11DeviceContext_RSSetViewports");
+        }
+
+        DECLARE_DETOUR_FUNCTION(static void,
+                                STDMETHODCALLTYPE,
+                                Deferred_OMSetRenderTargets,
+                                ID3D11DeviceContext* Context,
+                                UINT NumViews,
+                                ID3D11RenderTargetView* const* ppRenderTargetViews,
+                                ID3D11DepthStencilView* pDepthStencilView) {
+            g_original_Deferred_OMSetRenderTargets(Context, NumViews, ppRenderTargetViews, pDepthStencilView);
+            if (g_instance) {
+                g_instance->onSetRenderTargets(Context, NumViews, ppRenderTargetViews, pDepthStencilView);
+            }
+        }
+
+        DECLARE_DETOUR_FUNCTION(static void,
+                                STDMETHODCALLTYPE,
+                                Deferred_OMSetRenderTargetsAndUnorderedAccessViews,
+                                ID3D11DeviceContext* Context,
+                                UINT NumRTVs,
+                                ID3D11RenderTargetView* const* ppRenderTargetViews,
+                                ID3D11DepthStencilView* pDepthStencilView,
+                                UINT UAVStartSlot,
+                                UINT NumUAVs,
+                                ID3D11UnorderedAccessView* const* ppUnorderedAccessViews,
+                                const UINT* pUAVInitialCounts) {
+            g_original_Deferred_OMSetRenderTargetsAndUnorderedAccessViews(Context,
+                                                                          NumRTVs,
+                                                                          ppRenderTargetViews,
+                                                                          pDepthStencilView,
+                                                                          UAVStartSlot,
+                                                                          NumUAVs,
+                                                                          ppUnorderedAccessViews,
+                                                                          pUAVInitialCounts);
+            if (g_instance && NumRTVs != D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL) {
+                g_instance->onSetRenderTargets(Context, NumRTVs, ppRenderTargetViews, pDepthStencilView);
+            }
+        }
+
+        DECLARE_DETOUR_FUNCTION(static void,
+                                STDMETHODCALLTYPE,
+                                Deferred_RSSetViewports,
+                                ID3D11DeviceContext* Context,
+                                UINT NumViewports,
+                                const D3D11_VIEWPORT* pViewports) {
+            g_original_Deferred_RSSetViewports(Context, NumViewports, pViewports);
+            if (g_instance) {
+                g_instance->onSetViewports(Context);
+            }
+        }
+
+        DECLARE_DETOUR_FUNCTION(static void,
+                                STDMETHODCALLTYPE,
+                                ID3D11DeviceContext_ExecuteCommandList,
+                                ID3D11DeviceContext* Context,
+                                ID3D11CommandList* CommandList,
+                                BOOL RestoreContextState) {
+            if (g_instance) {
+                g_instance->onBeforeExecute(Context);
+            }
+            g_original_ID3D11DeviceContext_ExecuteCommandList(Context, CommandList, RestoreContextState);
+        }
+
+        DECLARE_DETOUR_FUNCTION(static void,
+                                STDMETHODCALLTYPE,
+                                ID3D11DeviceContext_DrawIndexed,
+                                ID3D11DeviceContext* Context,
+                                UINT IndexCount,
+                                UINT StartIndexLocation,
+                                INT BaseVertexLocation) {
+            if (g_instance) {
+                g_instance->onBeforeDraw(Context, IndexCount);
+            }
+            g_original_ID3D11DeviceContext_DrawIndexed(
+                Context, IndexCount, StartIndexLocation, BaseVertexLocation);
+        }
+
+        DECLARE_DETOUR_FUNCTION(static void,
+                                STDMETHODCALLTYPE,
+                                ID3D11DeviceContext_Draw,
+                                ID3D11DeviceContext* Context,
+                                UINT VertexCount,
+                                UINT StartVertexLocation) {
+            if (g_instance) {
+                g_instance->onBeforeDraw(Context, VertexCount);
+            }
+            g_original_ID3D11DeviceContext_Draw(Context, VertexCount, StartVertexLocation);
+        }
+
+        DECLARE_DETOUR_FUNCTION(static void,
+                                STDMETHODCALLTYPE,
+                                ID3D11DeviceContext_DrawIndexedInstanced,
+                                ID3D11DeviceContext* Context,
+                                UINT IndexCountPerInstance,
+                                UINT InstanceCount,
+                                UINT StartIndexLocation,
+                                INT BaseVertexLocation,
+                                UINT StartInstanceLocation) {
+            if (g_instance) {
+                // A glyph or panel quad is instanced. A large instance count used to
+                // be reported as 20001, and the overlay test then treated it as world.
+                const UINT span = (IndexCountPerInstance <= 96u)
+                                      ? IndexCountPerInstance
+                                      : ((IndexCountPerInstance > 16384u || InstanceCount > 512u)
+                                             ? 20001u
+                                             : IndexCountPerInstance * InstanceCount);
+                g_instance->onBeforeDraw(Context, span);
+            }
+            g_original_ID3D11DeviceContext_DrawIndexedInstanced(Context,
+                                                                IndexCountPerInstance,
+                                                                InstanceCount,
+                                                                StartIndexLocation,
+                                                                BaseVertexLocation,
+                                                                StartInstanceLocation);
+        }
+
+        DECLARE_DETOUR_FUNCTION(static void,
+                                STDMETHODCALLTYPE,
+                                ID3D11DeviceContext_DrawInstanced,
+                                ID3D11DeviceContext* Context,
+                                UINT VertexCountPerInstance,
+                                UINT InstanceCount,
+                                UINT StartVertexLocation,
+                                UINT StartInstanceLocation) {
+            if (g_instance) {
+                const UINT span = (VertexCountPerInstance <= 96u)
+                                      ? VertexCountPerInstance
+                                      : ((VertexCountPerInstance > 16384u || InstanceCount > 512u)
+                                             ? 20001u
+                                             : VertexCountPerInstance * InstanceCount);
+                g_instance->onBeforeDraw(Context, span);
+            }
+            g_original_ID3D11DeviceContext_DrawInstanced(
+                Context, VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation);
+        }
+
+        DECLARE_DETOUR_FUNCTION(static void,
+                                STDMETHODCALLTYPE,
+                                Deferred_DrawIndexed,
+                                ID3D11DeviceContext* Context,
+                                UINT IndexCount,
+                                UINT StartIndexLocation,
+                                INT BaseVertexLocation) {
+            if (g_instance) {
+                g_instance->onBeforeDraw(Context, IndexCount);
+            }
+            g_original_Deferred_DrawIndexed(Context, IndexCount, StartIndexLocation, BaseVertexLocation);
+        }
+
+        DECLARE_DETOUR_FUNCTION(static void,
+                                STDMETHODCALLTYPE,
+                                Deferred_Draw,
+                                ID3D11DeviceContext* Context,
+                                UINT VertexCount,
+                                UINT StartVertexLocation) {
+            if (g_instance) {
+                g_instance->onBeforeDraw(Context, VertexCount);
+            }
+            g_original_Deferred_Draw(Context, VertexCount, StartVertexLocation);
+        }
+
+        DECLARE_DETOUR_FUNCTION(static void,
+                                STDMETHODCALLTYPE,
+                                Deferred_DrawIndexedInstanced,
+                                ID3D11DeviceContext* Context,
+                                UINT IndexCountPerInstance,
+                                UINT InstanceCount,
+                                UINT StartIndexLocation,
+                                INT BaseVertexLocation,
+                                UINT StartInstanceLocation) {
+            if (g_instance) {
+                // A glyph or panel quad is instanced. A large instance count used to
+                // be reported as 20001, and the overlay test then treated it as world.
+                const UINT span = (IndexCountPerInstance <= 96u)
+                                      ? IndexCountPerInstance
+                                      : ((IndexCountPerInstance > 16384u || InstanceCount > 512u)
+                                             ? 20001u
+                                             : IndexCountPerInstance * InstanceCount);
+                g_instance->onBeforeDraw(Context, span);
+            }
+            g_original_Deferred_DrawIndexedInstanced(Context,
+                                                     IndexCountPerInstance,
+                                                     InstanceCount,
+                                                     StartIndexLocation,
+                                                     BaseVertexLocation,
+                                                     StartInstanceLocation);
+        }
+
+        DECLARE_DETOUR_FUNCTION(static void,
+                                STDMETHODCALLTYPE,
+                                Deferred_DrawInstanced,
+                                ID3D11DeviceContext* Context,
+                                UINT VertexCountPerInstance,
+                                UINT InstanceCount,
+                                UINT StartVertexLocation,
+                                UINT StartInstanceLocation) {
+            if (g_instance) {
+                const UINT span = (VertexCountPerInstance <= 96u)
+                                      ? VertexCountPerInstance
+                                      : ((VertexCountPerInstance > 16384u || InstanceCount > 512u)
+                                             ? 20001u
+                                             : VertexCountPerInstance * InstanceCount);
+                g_instance->onBeforeDraw(Context, span);
+            }
+            g_original_Deferred_DrawInstanced(
+                Context, VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation);
+        }
+
+        DECLARE_DETOUR_FUNCTION(static void, STDMETHODCALLTYPE, ID3D11DeviceContext_DrawAuto, ID3D11DeviceContext* Context) {
+            if (g_instance) {
+                g_instance->onBeforeDraw(Context);
+            }
+            g_original_ID3D11DeviceContext_DrawAuto(Context);
+        }
+
+        DECLARE_DETOUR_FUNCTION(static void,
+                                STDMETHODCALLTYPE,
+                                ID3D11DeviceContext_DrawIndexedInstancedIndirect,
+                                ID3D11DeviceContext* Context,
+                                ID3D11Buffer* BufferForArgs,
+                                UINT AlignedByteOffsetForArgs) {
+            if (g_instance) {
+                g_instance->onBeforeDraw(Context);
+            }
+            g_original_ID3D11DeviceContext_DrawIndexedInstancedIndirect(
+                Context, BufferForArgs, AlignedByteOffsetForArgs);
+        }
+
+        DECLARE_DETOUR_FUNCTION(static void,
+                                STDMETHODCALLTYPE,
+                                ID3D11DeviceContext_DrawInstancedIndirect,
+                                ID3D11DeviceContext* Context,
+                                ID3D11Buffer* BufferForArgs,
+                                UINT AlignedByteOffsetForArgs) {
+            if (g_instance) {
+                g_instance->onBeforeDraw(Context);
+            }
+            g_original_ID3D11DeviceContext_DrawInstancedIndirect(Context, BufferForArgs, AlignedByteOffsetForArgs);
+        }
+
+        DECLARE_DETOUR_FUNCTION(static void, STDMETHODCALLTYPE, Deferred_DrawAuto, ID3D11DeviceContext* Context) {
+            if (g_instance) {
+                g_instance->onBeforeDraw(Context);
+            }
+            g_original_Deferred_DrawAuto(Context);
+        }
+
+        DECLARE_DETOUR_FUNCTION(static void,
+                                STDMETHODCALLTYPE,
+                                Deferred_DrawIndexedInstancedIndirect,
+                                ID3D11DeviceContext* Context,
+                                ID3D11Buffer* BufferForArgs,
+                                UINT AlignedByteOffsetForArgs) {
+            if (g_instance) {
+                g_instance->onBeforeDraw(Context);
+            }
+            g_original_Deferred_DrawIndexedInstancedIndirect(Context, BufferForArgs, AlignedByteOffsetForArgs);
+        }
+
+        DECLARE_DETOUR_FUNCTION(static void,
+                                STDMETHODCALLTYPE,
+                                Deferred_DrawInstancedIndirect,
+                                ID3D11DeviceContext* Context,
+                                ID3D11Buffer* BufferForArgs,
+                                UINT AlignedByteOffsetForArgs) {
+            if (g_instance) {
+                g_instance->onBeforeDraw(Context);
+            }
+            g_original_Deferred_DrawInstancedIndirect(Context, BufferForArgs, AlignedByteOffsetForArgs);
         }
 
         DECLARE_DETOUR_FUNCTION(static void,
