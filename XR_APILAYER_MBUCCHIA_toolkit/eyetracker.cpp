@@ -51,6 +51,7 @@ namespace {
 
         void beginSession(XrSession session) override {
             m_session = session;
+            m_gazeSamples = 0;
 
             // Create a reference space.
             {
@@ -72,6 +73,8 @@ namespace {
             }
 
             m_session = XR_NULL_HANDLE;
+            m_frameTime = 0;
+            m_valid = false;
         }
 
         void beginFrame(XrTime frameTime) override {
@@ -133,6 +136,16 @@ namespace {
                     m_eyeGazeState.leftPoint.y = m_gaze[0].y;
                     m_eyeGazeState.rightPoint.x = m_gaze[1].x;
                     m_eyeGazeState.rightPoint.y = m_gaze[1].y;
+                    m_gazeSamples++;
+                    if (m_gazeSamples == 1 || m_gazeSamples == 300) {
+                        Log("Eye gaze screen #%u: %.3f, %.3f from %.3f, %.3f, %.3f\n",
+                            m_gazeSamples,
+                            m_gaze[0].x,
+                            m_gaze[0].y,
+                            projectedPoint.x,
+                            projectedPoint.y,
+                            projectedPoint.z);
+                    }
                 }
             }
 
@@ -160,6 +173,7 @@ namespace {
 
         mutable XrVector2f m_gaze[ViewCount];
         mutable bool m_valid{false};
+        mutable uint32_t m_gazeSamples{0};
         mutable EyeGazeState m_eyeGazeState{};
     };
 
@@ -176,6 +190,11 @@ namespace {
             EyeTrackerBase::beginSession(session);
 
             m_debugWithController = m_configManager->getValue(SettingEyeDebugWithController);
+            m_loggedAwaitingAttach = false;
+            m_loggedInactive = false;
+            m_loggedActive = false;
+            m_loggedPoint = false;
+            m_loggedSuggest = false;
 
             // Create the resources for the eye tracker space.
             {
@@ -194,31 +213,7 @@ namespace {
                 actionCreateInfo.countSubactionPaths = 0;
                 CHECK_XRCMD(m_openXR.xrCreateAction(m_eyeTrackerActionSet, &actionCreateInfo, &m_eyeGazeAction));
             }
-            {
-                XrActionSuggestedBinding binding;
-                binding.action = m_eyeGazeAction;
-
-                XrInteractionProfileSuggestedBinding suggestedBindings{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING,
-                                                                       nullptr};
-
-                if (!m_debugWithController) {
-                    CHECK_XRCMD(m_openXR.xrStringToPath(
-                        m_openXR.GetXrInstance(), "/user/eyes_ext/input/gaze_ext/pose", &binding.binding));
-                    CHECK_XRCMD(m_openXR.xrStringToPath(m_openXR.GetXrInstance(),
-                                                        "/interaction_profiles/ext/eye_gaze_interaction",
-                                                        &suggestedBindings.interactionProfile));
-                } else {
-                    // We use a Left HP motion controller to simulate the eye gaze.
-                    CHECK_XRCMD(m_openXR.xrStringToPath(
-                        m_openXR.GetXrInstance(), "/user/hand/left/input/grip/pose", &binding.binding));
-                    CHECK_XRCMD(m_openXR.xrStringToPath(m_openXR.GetXrInstance(),
-                                                        "/interaction_profiles/hp/mixed_reality_controller",
-                                                        &suggestedBindings.interactionProfile));
-                }
-                suggestedBindings.suggestedBindings = &binding;
-                suggestedBindings.countSuggestedBindings = 1;
-                CHECK_XRCMD(m_openXR.xrSuggestInteractionProfileBindings(m_openXR.GetXrInstance(), &suggestedBindings));
-            }
+            suggestBindings();
             {
                 XrActionSpaceCreateInfo actionSpaceCreateInfo{XR_TYPE_ACTION_SPACE_CREATE_INFO, nullptr};
                 actionSpaceCreateInfo.action = m_eyeGazeAction;
@@ -241,6 +236,36 @@ namespace {
             EyeTrackerBase::endSession();
         }
 
+        void suggestBindings() override {
+            if (m_eyeGazeAction == XR_NULL_HANDLE) {
+                return;
+            }
+
+            XrActionSuggestedBinding binding{};
+            binding.action = m_eyeGazeAction;
+            XrInteractionProfileSuggestedBinding suggestedBindings{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING,
+                                                                   nullptr};
+            const char* posePath = m_debugWithController ? "/user/hand/left/input/grip/pose"
+                                                         : "/user/eyes_ext/input/gaze_ext/pose";
+            const char* profilePath = m_debugWithController ? "/interaction_profiles/hp/mixed_reality_controller"
+                                                            : "/interaction_profiles/ext/eye_gaze_interaction";
+            if (XR_FAILED(m_openXR.xrStringToPath(m_openXR.GetXrInstance(), posePath, &binding.binding)) ||
+                XR_FAILED(m_openXR.xrStringToPath(
+                    m_openXR.GetXrInstance(), profilePath, &suggestedBindings.interactionProfile))) {
+                Log("Eye gaze binding path was rejected\n");
+                return;
+            }
+            suggestedBindings.suggestedBindings = &binding;
+            suggestedBindings.countSuggestedBindings = 1;
+            const XrResult suggested =
+                m_openXR.xrSuggestInteractionProfileBindings(m_openXR.GetXrInstance(), &suggestedBindings);
+            if (XR_FAILED(suggested)) {
+                Log("Eye gaze suggest bindings failed (%s)\n", xr::ToCString(suggested));
+                return;
+            }
+            Log("Eye gaze bindings suggested\n");
+        }
+
         bool getEyeGaze(XrVector3f& projectedPoint) const override {
             XrSpaceLocation location{XR_TYPE_SPACE_LOCATION, nullptr};
 
@@ -249,16 +274,33 @@ namespace {
                 XrActionStatePose actionStatePose{XR_TYPE_ACTION_STATE_POSE, nullptr};
                 XrActionStateGetInfo getActionStateInfo{XR_TYPE_ACTION_STATE_GET_INFO, nullptr};
                 getActionStateInfo.action = m_eyeGazeAction;
-                CHECK_XRCMD(m_openXR.xrGetActionStatePose(m_session, &getActionStateInfo, &actionStatePose));
+                const XrResult gazeState =
+                    m_openXR.xrGetActionStatePose(m_session, &getActionStateInfo, &actionStatePose);
+                // OpenComposite submits a skybox frame before xrAttachSessionActionSets. Throwing here is
+                // reported as XR_ERROR_RUNTIME_FAILURE from xrBeginFrame and aborts the game.
+                if (XR_FAILED(gazeState)) {
+                    if (gazeState == XR_ERROR_ACTIONSET_NOT_ATTACHED && !m_loggedAwaitingAttach) {
+                        Log("Eye gaze action set is not attached yet\n");
+                        m_loggedAwaitingAttach = true;
+                    }
+                    return false;
+                }
 
                 if (!actionStatePose.isActive) {
+                    if (!m_loggedInactive) {
+                        Log("Eye gaze pose is inactive\n");
+                        m_loggedInactive = true;
+                    }
                     return false;
+                }
+                if (!m_loggedActive) {
+                    Log("Eye gaze pose is active\n");
+                    m_loggedActive = true;
                 }
             }
 
-            CHECK_XRCMD(m_openXR.xrLocateSpace(m_eyeSpace, m_viewSpace, m_frameTime, &location));
-
-            if (!Pose::IsPoseValid(location.locationFlags)) {
+            const XrResult locateResult = m_openXR.xrLocateSpace(m_eyeSpace, m_viewSpace, m_frameTime, &location);
+            if (XR_FAILED(locateResult) || !Pose::IsPoseValid(location.locationFlags)) {
                 return false;
             }
 
@@ -270,7 +312,9 @@ namespace {
             const auto gazeProjectedPoint =
                 m_debugWithController
                     ? LoadXrVector3(location.pose.position)
-                    : DirectX::XMVector3Transform(DirectX::XMVectorSet(0, 0, 2, 1) /* 2m forward */, gaze);
+                    // OpenXR gaze looks along -Z. +Z put the aim point behind the head, so the
+                // sharp circle never landed on the picture.
+                : DirectX::XMVector3Transform(DirectX::XMVectorSet(0, 0, -2, 1), gaze);
 
             projectedPoint.x = gazeProjectedPoint.m128_f32[0];
             projectedPoint.y = gazeProjectedPoint.m128_f32[1];
@@ -285,6 +329,11 @@ namespace {
 
       private:
         bool m_debugWithController{false};
+        bool m_loggedSuggest{false};
+        mutable bool m_loggedAwaitingAttach{false};
+        mutable bool m_loggedInactive{false};
+        mutable bool m_loggedActive{false};
+        mutable bool m_loggedPoint{false};
         XrAction m_eyeGazeAction{XR_NULL_HANDLE};
         XrSpace m_eyeSpace{XR_NULL_HANDLE};
     };

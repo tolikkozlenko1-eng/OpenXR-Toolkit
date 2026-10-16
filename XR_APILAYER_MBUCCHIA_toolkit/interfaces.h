@@ -182,11 +182,15 @@ namespace toolkit {
         const std::string SettingPostShadows = "post_shadows";
         const std::string SettingPostChromaticCorrectionR = "post_ca_r";
         const std::string SettingPostChromaticCorrectionB = "post_ca_b";
+        const std::string SettingPostLumaSharpen = "post_luma_sharpen";
+        const std::string SettingPostLumaSharpenPattern = "post_luma_sharpen_pattern";
+        const std::string SettingPostLumaSharpenScale = "post_luma_sharpen_scale";
         const std::string SettingEyeTrackingEnabled = "eye_tracking";
         const std::string SettingEyeProjectionDistance = "eye_projection";
         const std::string SettingEyeDebug = "eye_debug";
         const std::string SettingEyeDebugWithController = "eye_controller_debug";
         const std::string SettingResolutionOverride = "override_resolution";
+        const std::string SettingResolutionWidth = "resolution_width";
         const std::string SettingResolutionHeight = "resolution_height";
         const std::string SettingDisableInterceptor = "disable_interceptor";
         const std::string SettingRecordStats = "record_stats";
@@ -201,7 +205,7 @@ namespace toolkit {
         enum class OverlayType { None = 0, FPS, Advanced, Developer, MaxValue };
         enum class MenuFontSize { Small = 0, Medium, Large, MaxValue };
         enum class MenuTimeout { Small = 0, Medium, Large, None, MaxValue };
-        enum class ScalingType { None = 0, NIS, FSR, CAS, MaxValue };
+        enum class ScalingType { None = 0, NIS, FSR, CAS, LSH, MaxValue };
         enum class MipMapBias { Off = 0, Anisotropic, All, MaxValue };
         enum class HandTrackingEnabled { Off = 0, Both, Left, Right, MaxValue };
         enum class HandTrackingVisibility { Hidden = 0, Bright, Medium, Dark, Darker, MaxValue };
@@ -647,6 +651,9 @@ namespace toolkit {
 
             virtual void blockCallbacks() = 0;
             virtual void unblockCallbacks() = 0;
+            // Draw hooks skip the per-draw call unless a VRS context still needs a latch.
+            virtual void setPendingVrsLatch() = 0;
+            virtual void clearPendingVrsLatch() = 0;
 
             using SetRenderTargetEvent =
                 std::function<void(std::shared_ptr<IContext>, std::shared_ptr<ITexture> renderTarget)>;
@@ -659,6 +666,17 @@ namespace toolkit {
                                                         int /* sourceSlice */,
                                                         int /* destinationSlice */)>;
             virtual void registerCopyTextureEvent(CopyTextureEvent event) = 0;
+            // Fired after the app's RSSetViewports. NVIDIA clears per-viewport VRS on that call.
+            using SetViewportEvent = std::function<void(std::shared_ptr<IContext>)>;
+            virtual void registerSetViewportEvent(SetViewportEvent event) = 0;
+            // Fired immediately before Draw*. The native context is the API context pointer.
+            // primitiveCount is the vertex or index span of this draw, or 0 when it is unknown.
+            // No per-draw allocation: Elite issues thousands of these.
+            using BeforeDrawEvent = std::function<void(void* nativeContext, uint32_t primitiveCount)>;
+            virtual void registerBeforeDrawEvent(BeforeDrawEvent event) = 0;
+            // Fired on the context that runs a command list, before ExecuteCommandList.
+            using BeforeExecuteEvent = std::function<void(void* nativeContext)>;
+            virtual void registerBeforeExecuteEvent(BeforeExecuteEvent event) = 0;
 
             virtual void getVRAMUsage(uint64_t& usage, uint8_t& percentUsed) const = 0;
 
@@ -740,6 +758,9 @@ namespace toolkit {
                                            std::shared_ptr<ITexture> renderTarget,
                                            std::optional<utilities::Eye> eyeHint) = 0;
             virtual void onUnsetRenderTarget(std::shared_ptr<graphics::IContext> context) = 0;
+            virtual void onSetViewports(std::shared_ptr<IContext> context) = 0;
+            virtual void onBeforeDraw(void* nativeContext, uint32_t primitiveCount) = 0;
+            virtual void onBeforeExecute(void* nativeContext) = 0;
 
             virtual void updateGazeLocation(XrVector2f gaze, utilities::Eye eye) = 0;
             virtual void setViewProjectionCenters(XrVector2f left, XrVector2f right) = 0;
@@ -751,6 +772,12 @@ namespace toolkit {
             virtual void startCapture() = 0;
             virtual void stopCapture() = 0;
         };
+
+        // FNV-1a 64 of a D3D11 CreateVertexShader blob. Records only the four Elite UI
+        // vertex shaders (vector HUD, target indicator, HUD icons, holo panel composite).
+        void noteEliteUiVertexShader(void* shader, const void* bytecode, size_t length);
+        // True when this shader pointer is one of those four. logDraw is set once per hash.
+        bool matchEliteUiVertexShader(void* shader, uint64_t& hash, bool& logDraw);
 
     } // namespace graphics
 
@@ -830,6 +857,10 @@ namespace toolkit {
             virtual void update() = 0;
 
             virtual XrActionSet getActionSet() const = 0;
+            // OpenComposite suggests controller bindings and then attaches once. Re-suggest
+            // immediately before that attach so the eye profile is not dropped.
+            virtual void suggestBindings() {
+            }
             virtual bool getProjectedGaze(XrVector2f gaze[utilities::ViewCount]) const = 0;
 
             virtual bool isProjectionDistanceSupported() const = 0;

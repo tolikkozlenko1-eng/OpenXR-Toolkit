@@ -38,10 +38,12 @@ namespace {
 
     struct alignas(16) ImageProcessorConfig {
         XrVector4f Params1; // Contrast, Brightness, Exposure, Saturation (-1..+1 params)
-        XrVector4f Params2; // ColorGainR, ColorGainG, ColorGainB (-1..+1 params)
+        XrVector4f Params2; // ColorGainR, ColorGainG, ColorGainB (-1..+1 params), LumaSharpen strength
         XrVector4f Params3; // Highlights, Shadows, Vibrance (0..1 params), UseCA (0 = off, 1 = on)
-        XrVector4f Params4; // ChromaticCorrectionR, ChromaticCorrectionG, ChromaticCorrectionB (-1..+1 params)
-                            // Eye (0 = left, 1 = right)
+        XrVector4f Params4; // ChromaticCorrectionR, ChromaticCorrectionG, ChromaticCorrectionB (-1..+1 params), Eye
+        XrVector4f Params5; // BorderFade, CornerStyle, CornerRadius, OuterSideFlag
+        XrVector4f Params6; // VisibleLeft, VisibleRight, VisibleTop, VisibleBottom
+        XrVector4f Params7; // LumaSharpen pattern, scale/offset_bias
     };
 
     class ImageProcessor : public IImageProcessor {
@@ -115,8 +117,11 @@ namespace {
         }
 
         bool checkUpdateConfig(PostProcessType mode) const {
+            const bool lumaChanged = m_configManager->hasChanged(SettingPostLumaSharpen) ||
+                                     m_configManager->hasChanged(SettingPostLumaSharpenPattern) ||
+                                     m_configManager->hasChanged(SettingPostLumaSharpenScale);
             if (mode != PostProcessType::Off) {
-                return m_configManager->hasChanged(SettingPostSunGlasses) ||
+                return lumaChanged || m_configManager->hasChanged(SettingPostSunGlasses) ||
                        m_configManager->hasChanged(SettingPostContrast) ||
                        m_configManager->hasChanged(SettingPostBrightness) ||
                        m_configManager->hasChanged(SettingPostExposure) ||
@@ -130,7 +135,7 @@ namespace {
                        m_configManager->hasChanged(SettingPostChromaticCorrectionR) ||
                        m_configManager->hasChanged(SettingPostChromaticCorrectionB);
             } else {
-                return m_configManager->hasChanged(SettingPostColorGainR) ||
+                return lumaChanged || m_configManager->hasChanged(SettingPostColorGainR) ||
                        m_configManager->hasChanged(SettingPostColorGainB);
             }
         }
@@ -172,6 +177,10 @@ namespace {
             } else {
                 m_config.Params3.w = 0;
             }
+
+            m_config.Params2.w = m_configManager->getValue(SettingPostLumaSharpen) / 100.f;
+            m_config.Params7.x = static_cast<float>(m_configManager->getValue(SettingPostLumaSharpenPattern));
+            m_config.Params7.y = m_configManager->getValue(SettingPostLumaSharpenScale) / 100.f;
         }
 
         static std::array<DirectX::XMINT4, 3> GetParams(const IConfigManager* configManager, size_t index) {
