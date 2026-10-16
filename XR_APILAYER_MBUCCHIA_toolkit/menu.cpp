@@ -1255,6 +1255,30 @@ namespace {
                                          100,
                                          MenuEntry::FmtPercent});
 
+                m_menuEntries.push_back({MenuIndent::SubGroupIndent,
+                                         "Lumina Sharpen",
+                                         MenuEntryType::Slider,
+                                         SettingPostLumaSharpen,
+                                         0,
+                                         300,
+                                         [](int value) { return fmt::format("{:.2f}", value / 100.f); }});
+                m_menuEntries.push_back({MenuIndent::SubGroupIndent,
+                                         "Lumina pattern",
+                                         MenuEntryType::Slider,
+                                         SettingPostLumaSharpenPattern,
+                                         1,
+                                         3,
+                                         [](int value) {
+                                             return value <= 1 ? "Normal" : value == 2 ? "Wider" : "Pyramid";
+                                         }});
+                m_menuEntries.push_back({MenuIndent::SubGroupIndent,
+                                         "Lumina scale",
+                                         MenuEntryType::Slider,
+                                         SettingPostLumaSharpenScale,
+                                         10,
+                                         600,
+                                         [](int value) { return fmt::format("{:.2f}", value / 100.f); }});
+
                 // TODO: Mip-map biasing is only supported on D3D11.
                 if (m_device->getApi() == Api::D3D11) {
                     MenuGroup mipmappingGroup(this, [&] { return getCurrentScaling() != 100; });
@@ -1269,6 +1293,35 @@ namespace {
                     mipmappingGroup.finalize();
                 }
                 upscalingGroup.finalize();
+            }
+
+            // Lumina is a post pass. It has to be selectable without NIS, FSR, or CAS.
+            {
+                MenuGroup luminaGroup(this, [&] { return getCurrentScalingType() == ScalingType::LSH; });
+                m_menuEntries.push_back({MenuIndent::SubGroupIndent,
+                                         "Lumina Sharpen",
+                                         MenuEntryType::Slider,
+                                         SettingPostLumaSharpen,
+                                         0,
+                                         300,
+                                         [](int value) { return fmt::format("{:.2f}", value / 100.f); }});
+                m_menuEntries.push_back({MenuIndent::SubGroupIndent,
+                                         "Lumina pattern",
+                                         MenuEntryType::Slider,
+                                         SettingPostLumaSharpenPattern,
+                                         1,
+                                         3,
+                                         [](int value) {
+                                             return value <= 1 ? "Normal" : value == 2 ? "Wider" : "Pyramid";
+                                         }});
+                m_menuEntries.push_back({MenuIndent::SubGroupIndent,
+                                         "Lumina scale",
+                                         MenuEntryType::Slider,
+                                         SettingPostLumaSharpenScale,
+                                         10,
+                                         600,
+                                         [](int value) { return fmt::format("{:.2f}", value / 100.f); }});
+                luminaGroup.finalize();
             }
 
             // Fixed Foveated Rendering (VRS) Settings.
@@ -1697,16 +1750,22 @@ namespace {
 
             MenuGroup resolutionGroup(this, [&] { return m_configManager->peekValue(SettingResolutionOverride); });
             m_originalResolutionHeight = m_displayHeight;
+            m_originalResolutionWidth = m_configManager->peekValue(SettingResolutionWidth);
             m_menuEntries.push_back({MenuIndent::SubGroupIndent,
-                                     "Display resolution (per eye)",
+                                     "Display width (per eye)",
+                                     MenuEntryType::Slider,
+                                     SettingResolutionWidth,
+                                     500,
+                                     8192,
+                                     [](int value) { return fmt::format("{}", value); }});
+            m_menuEntries.back().acceleration = 10;
+            m_menuEntries.push_back({MenuIndent::SubGroupIndent,
+                                     "Display height (per eye)",
                                      MenuEntryType::Slider,
                                      SettingResolutionHeight,
                                      500,
                                      static_cast<int>(menuInfo.maxDisplayHeight),
-                                     [&](int value) {
-                                         return fmt::format(
-                                             "{}x{}", static_cast<int>(value / m_resolutionHeightRatio), value);
-                                     }});
+                                     [](int value) { return fmt::format("{}", value); }});
             m_menuEntries.back().acceleration = 10;
             resolutionGroup.finalize();
 
@@ -2076,9 +2135,14 @@ namespace {
         }
 
         uint32_t getDisplayWidth() const {
-            return m_configManager->peekValue(SettingResolutionOverride)
-                       ? (uint32_t)(m_configManager->peekValue(SettingResolutionHeight) / m_resolutionHeightRatio)
-                       : m_displayWidth;
+            if (m_configManager->peekValue(SettingResolutionOverride)) {
+                const int storedWidth = m_configManager->peekValue(SettingResolutionWidth);
+                if (storedWidth > 0) {
+                    return static_cast<uint32_t>(storedWidth);
+                }
+                return (uint32_t)(m_configManager->peekValue(SettingResolutionHeight) / m_resolutionHeightRatio);
+            }
+            return m_displayWidth;
         }
 
         uint32_t getDisplayHeight() const {
@@ -2106,13 +2170,16 @@ namespace {
                 return true;
             }
 
-            if ((m_originalScalingType != ScalingType::None) && (m_originalScalingValue != getCurrentScaling() ||
-                                                                 m_originalAnamorphicValue != getCurrentAnamorphic())) {
+            if ((m_originalScalingType == ScalingType::NIS || m_originalScalingType == ScalingType::FSR ||
+                 m_originalScalingType == ScalingType::CAS) &&
+                (m_originalScalingValue != getCurrentScaling() ||
+                 m_originalAnamorphicValue != getCurrentAnamorphic())) {
                 return true;
             }
 
             if (m_configManager->peekValue(SettingResolutionOverride) &&
-                m_originalResolutionHeight != m_configManager->peekValue(SettingResolutionHeight)) {
+                (m_originalResolutionHeight != m_configManager->peekValue(SettingResolutionHeight) ||
+                 m_originalResolutionWidth != m_configManager->peekValue(SettingResolutionWidth))) {
                 return true;
             }
 
@@ -2173,6 +2240,7 @@ namespace {
         bool m_originalHandTrackingEnabled{false};
         bool m_originalEyeTrackingEnabled{false};
         int m_originalResolutionHeight{0};
+        int m_originalResolutionWidth{0};
         bool m_originalMotionReprojectionEnabled{false};
         bool m_needRestart{false};
 
