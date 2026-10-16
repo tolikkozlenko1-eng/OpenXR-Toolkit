@@ -1954,6 +1954,21 @@ namespace {
             m_copyTextureEvent = event;
         }
 
+        void registerSetViewportEvent(SetViewportEvent) override {
+        }
+
+        void registerBeforeDrawEvent(BeforeDrawEvent) override {
+        }
+
+        void registerBeforeExecuteEvent(BeforeExecuteEvent) override {
+        }
+
+        void setPendingVrsLatch() override {
+        }
+
+        void clearPendingVrsLatch() override {
+        }
+
         void getVRAMUsage(uint64_t& usage, uint8_t& percentUsed) const {
             utilities::GetVRAMUsage(m_adapter, usage, percentUsed);
         }
