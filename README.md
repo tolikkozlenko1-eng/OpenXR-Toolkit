@@ -6,6 +6,7 @@ What this branch adds on top of Matthieu Bucchianeri's Toolkit:
 
 - One eye-tracked foveation circle for OpenComposite games that draw each eye as its own picture. That path is meant to work universally on those titles
 - Tested in Elite Dangerous (with EDVR) and Skyrim VR
+- Exception: games like Fallout 4 VR, which render stereo ass-backwards as one wide side-by-side picture. Leave foveation off for that kind of game
 - NVIDIA D3D11 variable rate shading (inner disk full rate, outside 1/16)
 - Elite overlay, name, menu, and marker full-rate matching, gated to application names that contain `EliteDangerous`. Other games keep the gaze circle
 
