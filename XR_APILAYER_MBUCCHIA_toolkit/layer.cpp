@@ -162,6 +162,9 @@ namespace {
             m_configManager->setDefault(config::SettingPostShadows, 0);
             m_configManager->setDefault(config::SettingPostChromaticCorrectionR, 100090);
             m_configManager->setDefault(config::SettingPostChromaticCorrectionB, 99880);
+            m_configManager->setDefault(config::SettingPostLumaSharpen, 0);
+            m_configManager->setDefault(config::SettingPostLumaSharpenPattern, 1);
+            m_configManager->setDefault(config::SettingPostLumaSharpenScale, 100);
 
             // TODO: Appearance (User)
 #if 0
@@ -357,16 +360,24 @@ namespace {
                 if (XR_SUCCEEDED(OpenXrApi::xrGetSystem(GetXrInstance(), &getInfo, &systemId))) {
                     XrSystemProperties systemProperties{XR_TYPE_SYSTEM_PROPERTIES};
                     CHECK_XRCMD(OpenXrApi::xrGetSystemProperties(GetXrInstance(), systemId, &systemProperties));
-                    if (std::string(systemProperties.systemName).find("aapvr") != std::string::npos) {
+                    // Old Pimax SteamVR driver used "aapvr" and the Droolon aSeeVR server.
+                    // Native PiOpenXR (Dream Air) exposes XR_EXT_eye_gaze_interaction. Calling aSeeVR there
+                    // does not connect, and the installed build then forced the tracker off.
+                    const std::string sysName = systemProperties.systemName;
+                    const bool legacyDroolon = sysName.find("aapvr") != std::string::npos;
+                    if (legacyDroolon) {
                         aSeeVRInitParam param;
                         param.ports[0] = m_configManager->getValue("droolon_port");
-                        Log("--> aSeeVR_connect_server(%d)\n", param.ports[0]);
+                        Log("--> aSeeVR_connect_server(%d) sys=%s\n", param.ports[0], sysName.c_str());
                         const auto code = aSeeVR_connect_server(&param);
                         m_hasPimaxEyeTracker = code == ASEEVR_RETURN_CODE::success;
                         Log("<-- aSeeVR_connect_server %d\n", code);
                         if (m_hasPimaxEyeTracker) {
-                            Log("Detected Pimax Droolon support\n");
+                            Log("Detected Pimax Droolon / aSeeVR support\n");
                         }
+                    } else if (sysName.find("Pimax") != std::string::npos || sysName.find("pimax") != std::string::npos) {
+                        Log("Pimax runtime without aapvr - use OpenXR eye gaze (Tobii/Dream Air), not aSeeVR\n");
+                        m_hasPimaxEyeTracker = false;
                     }
                 }
             }
@@ -440,18 +451,8 @@ namespace {
                 m_resolutionHeightRatio = (float)m_displayHeight / m_displayWidth;
 
                 m_configManager->setDefault(config::SettingResolutionHeight, m_displayHeight);
-
-                // Workaround: the previous versions of the toolkit used a different representation for the resolution
-                // override.
-                // Migrate the value upon first run.
-                m_configManager->setDefault("resolution_width", 0);
-                if (m_configManager->getValue("resolution_width") != 0) {
-                    const int migratedValue =
-                        (int)(m_configManager->getValue("resolution_width") * m_resolutionHeightRatio);
-                    m_configManager->setValue(config::SettingResolutionHeight, migratedValue, true);
-                    m_configManager->deleteValue("resolution_width");
-                    m_configManager->tick();
-                }
+                // Keep an existing per-eye width. Stock toolkit deleted resolution_width and folded the
+                // override into one aspect-locked height. That wiped saved sizes such as 4000x4000.
 
                 m_maxDisplayHeight = std::min(views[0].maxImageRectHeight,
                                               (uint32_t)(views[0].maxImageRectWidth * m_resolutionHeightRatio));
@@ -481,13 +482,18 @@ namespace {
                     TLArg(handTrackingSystemProperties.supportsHandTracking, "SupportsHandTracking"),
                     TLArg(eyeTrackingSystemProperties.supportsEyeGazeInteraction, "SupportsEyeGazeInteraction"));
                 Log("Using OpenXR system %s\n", m_systemName.c_str());
+                Log("Eye gaze supported by runtime: %d\n",
+                    eyeTrackingSystemProperties.supportsEyeGazeInteraction ? 1 : 0);
 
                 const auto isWMR = m_runtimeName.find("Windows Mixed Reality Runtime") != std::string::npos;
                 const auto isVive = m_runtimeName.find("Vive Reality Runtime") != std::string::npos;
                 const auto isVarjo = m_runtimeName.find("Varjo") != std::string::npos;
                 const auto isSteamVR = m_runtimeName.find("SteamVR") != std::string::npos;
 
-                m_supportMotionReprojectionLock = isWMR;
+                // Show Motion reprojection for WMR and Pimax/OpenComposite (Pimax OpenXR).
+                m_supportMotionReprojectionLock =
+                    isWMR || m_runtimeName.find("Pimax") != std::string::npos ||
+                    m_applicationName.find("OpenComposite") != std::string::npos;
 
                 // Fix Fallout 4 / OpenComposite Decal Issue for WMR
                 m_overrideParallelProjection =
@@ -498,8 +504,8 @@ namespace {
                 m_hasPerformanceCounterKHR = !isVive;
 
                 // Workaround: the Varjo and SteamVR runtimes always advertises maxImageRect==recommendedImageRect.
-                if (isVarjo || isSteamVR) {
-                    m_maxDisplayHeight = 8192;
+                if (isVarjo || isSteamVR || m_runtimeName.find("Pimax") != std::string::npos) {
+                    m_maxDisplayHeight = std::max(m_maxDisplayHeight, 8192u);
                 }
 
                 m_supportHandTracking = handTrackingSystemProperties.supportsHandTracking;
@@ -549,7 +555,12 @@ namespace {
                 // Apply override to the target resolution.
                 if (m_configManager->getValue(config::SettingResolutionOverride)) {
                     m_displayHeight = m_configManager->getValue(config::SettingResolutionHeight);
-                    m_displayWidth = (uint32_t)(m_displayHeight / m_resolutionHeightRatio);
+                    const int storedWidth = m_configManager->getValue(config::SettingResolutionWidth);
+                    if (storedWidth > 0) {
+                        m_displayWidth = static_cast<uint32_t>(storedWidth);
+                    } else {
+                        m_displayWidth = (uint32_t)(m_displayHeight / m_resolutionHeightRatio);
+                    }
 
                     Log("Overriding OpenXR resolution: %ux%u\n", m_displayWidth, m_displayHeight);
                 }
@@ -607,6 +618,7 @@ namespace {
 
                
                 case config::ScalingType::None:
+                case config::ScalingType::LSH:
                     break;
 
                 default:
@@ -725,6 +737,7 @@ namespace {
                         break;
 
                     case config::ScalingType::None:
+                    case config::ScalingType::LSH:
                         break;
 
                     default:
@@ -777,6 +790,15 @@ namespace {
                             [&](std::shared_ptr<graphics::IContext> context,
                                 std::shared_ptr<graphics::ITexture> renderTarget) {
                                 if (!m_isInFrame) {
+                                    if (!m_loggedVrsOutsideFrame && renderTarget) {
+                                        const auto& info = renderTarget->getInfo();
+                                        if (info.width >= 2048 && info.height >= 2048) {
+                                            Log("VRS scene-sized target bound outside the frame: %ux%u\n",
+                                                info.width,
+                                                info.height);
+                                            m_loggedVrsOutsideFrame = true;
+                                        }
+                                    }
                                     return;
                                 }
 
@@ -821,6 +843,25 @@ namespace {
                             if (m_frameAnalyzer) {
                                 m_frameAnalyzer->onCopyTexture(source, destination, sourceSlice, destinationSlice);
                             }
+                        });
+                        m_graphicsDevice->registerSetViewportEvent(
+                            [&](std::shared_ptr<graphics::IContext> context) {
+                                if (!m_isInFrame || !m_variableRateShader) {
+                                    return;
+                                }
+                                m_variableRateShader->onSetViewports(context);
+                            });
+                        m_graphicsDevice->registerBeforeDrawEvent([&](void* nativeContext, uint32_t primitiveCount) {
+                            if (!m_isInFrame || !m_variableRateShader) {
+                                return;
+                            }
+                            m_variableRateShader->onBeforeDraw(nativeContext, primitiveCount);
+                        });
+                        m_graphicsDevice->registerBeforeExecuteEvent([&](void* nativeContext) {
+                            if (!m_isInFrame || !m_variableRateShader) {
+                                return;
+                            }
+                            m_variableRateShader->onBeforeExecute(nativeContext);
                         });
                     }
 
@@ -893,6 +934,7 @@ namespace {
 
                     // Re-attach action set for the eye tracker if needed.
                     m_isActionSetAttached = false;
+                    m_isActionSetUsed = false;
 
                     // Remember the XrSession to use.
                     m_vrSession = *session;
@@ -1291,6 +1333,9 @@ namespace {
             XrSessionActionSetsAttachInfo chainAttachInfo = *attachInfo;
             std::vector<XrActionSet> newActionSets;
             if (m_eyeTracker && isVrSession(session)) {
+                // OpenComposite suggests every controller profile, then attaches its info set alone.
+                // Suggest the eye profile again so it is the binding the runtime freezes.
+                m_eyeTracker->suggestBindings();
                 const auto eyeTrackerActionSet = m_eyeTracker->getActionSet();
                 if (eyeTrackerActionSet != XR_NULL_HANDLE) {
                     newActionSets.resize(chainAttachInfo.countActionSets + 1);
@@ -1307,7 +1352,12 @@ namespace {
                 m_isActionSetUsed = attachInfo->countActionSets > 0;
             }
 
-            return OpenXrApi::xrAttachSessionActionSets(session, &chainAttachInfo);
+            // FO4VR/OpenComposite: remember attach so we do not early-claim the session again.
+            const XrResult attachResult = OpenXrApi::xrAttachSessionActionSets(session, &chainAttachInfo);
+            if (XR_SUCCEEDED(attachResult) && m_eyeTracker && isVrSession(session)) {
+                m_isActionSetAttached = true;
+            }
+            return attachResult;
         }
 
         XrResult xrCreateAction(XrActionSet actionSet,
@@ -1879,7 +1929,7 @@ namespace {
 
             XrActionsSyncInfo chainSyncInfo = *syncInfo;
             std::vector<XrActiveActionSet> newActiveActionSets;
-            if (m_eyeTracker && isVrSession(session)) {
+            if (m_eyeTracker && m_isActionSetAttached && isVrSession(session)) {
                 const auto eyeTrackerActionSet = m_eyeTracker->getActionSet();
                 if (eyeTrackerActionSet != XR_NULL_HANDLE) {
                     newActiveActionSets.resize(chainSyncInfo.countActiveActionSets + 1);
@@ -2264,17 +2314,12 @@ namespace {
                 }
 
                 if (m_eyeTracker || m_handTracker) {
-                    // Force artifical syncing of actions if the app doesn't seem to use actions.
+                    // Do NOT early-attach an empty action-set list. That claims the session's single
+                    // xrAttachSessionActionSets slot and breaks OpenComposite (FO4VR/SkyrimVR) with
+                    // XR_ERROR_ACTIONSETS_ALREADY_ATTACHED when OC later binds controllers.
+                    // Eye sets are merged in xrAttachSessionActionSets when the app/OC attaches.
                     if (!m_isActionSetUsed) {
                         if (m_eyeTracker && m_eyeTracker->getActionSet() != XR_NULL_HANDLE) {
-                            if (!m_isActionSetAttached) {
-                                XrSessionActionSetsAttachInfo attachInfo{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
-                                CHECK_XRCMD(xrAttachSessionActionSets(m_vrSession, &attachInfo));
-                                m_isActionSetAttached = true;
-                            }
-
-                            // The app does not implement controller support, we must sync actions ourselves.
-
                             // Workaround: the eye tracker on Varjo does not seem to connect unless the app calls
                             // xrPollEvent(). So we make a call here if the app does not call it. A disciplined app
                             // should have called xrPollEvent() by now just to begin the session.
@@ -2283,9 +2328,7 @@ namespace {
                                 OpenXrApi::xrPollEvent(GetXrInstance(), &buf);
                             }
                         }
-
-                        XrActionsSyncInfo syncInfo{XR_TYPE_ACTIONS_SYNC_INFO};
-                        CHECK_XRCMD(xrSyncActions(m_vrSession, &syncInfo));
+                        // Skip xrSyncActions until something has attached action sets (OpenComposite FO4VR path).
                     }
 
                     if (m_eyeTracker) {
@@ -2506,7 +2549,8 @@ namespace {
             parameters << '_' << ((st.wYear * 10000u) + (st.wMonth * 100u) + (st.wDay)) << '_'
                        << ((st.wHour * 10000u) + (st.wMinute * 100u) + (st.wSecond));
 
-            if (m_upscaleMode != config::ScalingType::None) {
+            if (m_upscaleMode == config::ScalingType::NIS || m_upscaleMode == config::ScalingType::FSR ||
+                m_upscaleMode == config::ScalingType::CAS) {
                 // TODO: add a getUpscaleModeName() helper to keep enum and string in sync.
                 const auto upscaleName = m_upscaleMode == config::ScalingType::NIS   ? "_NIS_"
                                          : m_upscaleMode == config::ScalingType::FSR ? "_FSR_"
@@ -3029,6 +3073,7 @@ namespace {
                 const bool drawHands = m_handTracker && m_configManager->peekEnumValue<config::HandTrackingVisibility>(
                                                             config::SettingHandVisibilityAndSkinTone) !=
                                                             config::HandTrackingVisibility::Hidden;
+                // The gaze mark is the green square. Eye tracking stays on without it.
                 const bool drawEyeGaze = m_eyeTracker && m_configManager->getValue(config::SettingEyeDebug);
 
                 m_stats.overlayCpuTimeUs += m_performanceCounters.overlayCpuTimer->query();
@@ -3072,7 +3117,7 @@ namespace {
                                 pos.x = viewportForOverlay[eye].offset.x + pos.x * viewportForOverlay[eye].extent.width;
                                 pos.y =
                                     viewportForOverlay[eye].offset.y + pos.y * viewportForOverlay[eye].extent.height;
-                                m_graphicsDevice->clearColor(pos.y - 20, pos.x - 20, pos.y + 20, pos.x + 20, color);
+                                m_graphicsDevice->clearColor(pos.y - 36, pos.x - 36, pos.y + 36, pos.x + 36, color);
                             }
                         }
 
@@ -3412,6 +3457,7 @@ namespace {
         XrTime m_savedFrameTime1;
         XrTime m_savedFrameTime2;
         bool m_isInFrame{false};
+        bool m_loggedVrsOutsideFrame{false};
         bool m_sendInterationProfileEvent{false};
         uint32_t m_visibilityMaskEventIndex{utilities::ViewCount};
         XrSpace m_viewSpace{XR_NULL_HANDLE};
