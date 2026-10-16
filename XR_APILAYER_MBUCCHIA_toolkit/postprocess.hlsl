@@ -25,9 +25,12 @@
 
 cbuffer config : register(b0) {
     float4 Params1;  // Contrast, Brightness, Exposure, Saturation (-1..+1 params)
-    float4 Params2;  // ColorGainR, ColorGainG, ColorGainB (-1..+1 params)
+    float4 Params2;  // ColorGainR, ColorGainG, ColorGainB (-1..+1 params), LumaSharpen strength (0..3)
     float4 Params3;  // Highlights, Shadows, Vibrance (0..1 params), UseCA (0 = off, 1 = on)
-    float4 Params4;  // ChromaticCorrectionR, ChromaticCorrectionG, ChromaticCorrectionB (-1..+1 params), Eye (0 = left, 1 = right)
+    float4 Params4;  // ChromaticCorrectionR, ChromaticCorrectionG, ChromaticCorrectionB (-1..+1 params), Eye
+    float4 Params5;  // BorderFade, CornerStyle, CornerRadius, OuterSideFlag
+    float4 Params6;  // VisibleLeft, VisibleRight, VisibleTop, VisibleBottom
+    float4 Params7;  // LumaSharpen pattern (1..3), scale/offset_bias (0..6), unused, unused
 };
 
 SamplerState sourceSampler : register(s0);
@@ -155,8 +158,140 @@ float3 AdjustHighlightsShadows(float3 color, float2 amount) {
   return (color/luma) * (h + s - luma);
 }
 
+// CeeJay LumaSharpen matching SBoys3 CustomHeadset compositor filter.
+// Params2.w = strength (0 = off, 2.0 = SBoys3 default). Clamp 0.1.
+// Params7.x = pattern 1/2/3 (Normal / Wider / Pyramid). Params7.y = scale (offset_bias, default 1.0).
+float3 ApplyLumaSharpen(float3 ori, float2 texcoord) {
+  float strength = Params2.w;
+  if (strength <= 0.0) {
+    return ori;
+  }
+
+  float2 texSize;
+  sourceTexture.GetDimensions(texSize.x, texSize.y);
+  float2 inverseTextureSize = rcp(texSize);
+  const float offset_bias = Params7.y > 0.0 ? Params7.y : 1.0;
+  const int pattern = (int)(Params7.x + 0.5);
+  const float sharp_clamp = 0.1;
+  const float3 CoefLuma = float3(0.2126, 0.7152, 0.0722);
+
+  float3 sharp_strength_luma = CoefLuma * strength;
+  float3 blur_ori;
+
+  // Pattern 1 — Normal: 9 tap gaussian, 4 extra taps (SBoys3 default).
+  if (pattern <= 1) {
+    blur_ori  = SAMPLE_TEXTURE(texcoord + float2(inverseTextureSize.x, -inverseTextureSize.y) * 0.5 * offset_bias).rgb;
+    blur_ori += SAMPLE_TEXTURE(texcoord - inverseTextureSize * 0.5 * offset_bias).rgb;
+    blur_ori += SAMPLE_TEXTURE(texcoord + inverseTextureSize * 0.5 * offset_bias).rgb;
+    blur_ori += SAMPLE_TEXTURE(texcoord - float2(inverseTextureSize.x, -inverseTextureSize.y) * 0.5 * offset_bias).rgb;
+    blur_ori *= 0.25;
+  }
+  // Pattern 2 — Wider: experimental 17 tap gaussian, 4 extra taps.
+  else if (pattern == 2) {
+    blur_ori  = SAMPLE_TEXTURE(texcoord + inverseTextureSize * float2(0.4, -1.2) * offset_bias).rgb;
+    blur_ori += SAMPLE_TEXTURE(texcoord - inverseTextureSize * float2(1.2, 0.4) * offset_bias).rgb;
+    blur_ori += SAMPLE_TEXTURE(texcoord + inverseTextureSize * float2(1.2, 0.4) * offset_bias).rgb;
+    blur_ori += SAMPLE_TEXTURE(texcoord - inverseTextureSize * float2(0.4, -1.2) * offset_bias).rgb;
+    blur_ori *= 0.25;
+    sharp_strength_luma *= 0.51;
+  }
+  // Pattern 3 — Pyramid: 9 tap high pass, 4 extra taps.
+  else {
+    blur_ori  = SAMPLE_TEXTURE(texcoord + float2(0.5 * inverseTextureSize.x, -inverseTextureSize.y * offset_bias)).rgb;
+    blur_ori += SAMPLE_TEXTURE(texcoord + float2(offset_bias * -inverseTextureSize.x, 0.5 * -inverseTextureSize.y)).rgb;
+    blur_ori += SAMPLE_TEXTURE(texcoord + float2(offset_bias * inverseTextureSize.x, 0.5 * inverseTextureSize.y)).rgb;
+    blur_ori += SAMPLE_TEXTURE(texcoord + float2(0.5 * -inverseTextureSize.x, inverseTextureSize.y * offset_bias)).rgb;
+    blur_ori *= 0.25;
+    sharp_strength_luma *= 0.666;
+  }
+
+  float3 sharp = ori - blur_ori;
+  float4 sharp_strength_luma_clamp = float4(sharp_strength_luma * (0.5 / sharp_clamp), 0.5);
+  float sharp_luma = saturate(dot(float4(sharp, 1.0), sharp_strength_luma_clamp));
+  sharp_luma = (sharp_clamp * 2.0) * sharp_luma - sharp_clamp;
+  return ori + sharp_luma;
+}
+
+float RectMask(float2 uv, float4 bounds) {
+  float insideX = step(bounds.x, uv.x) * step(uv.x, bounds.y);
+  float insideY = step(bounds.z, uv.y) * step(uv.y, bounds.w);
+  return insideX * insideY;
+}
+
+float FadeMask(float2 uv, float4 bounds, float fadeWidth) {
+  if (fadeWidth <= 0.00001)
+    return RectMask(uv, bounds);
+
+  float distLeft   = uv.x - bounds.x;
+  float distRight  = bounds.y - uv.x;
+  float distTop    = uv.y - bounds.z;
+  float distBottom = bounds.w - uv.y;
+
+  float edgeDist = min(min(distLeft, distRight), min(distTop, distBottom));
+  return RectMask(uv, bounds) * smoothstep(0.0, fadeWidth, edgeDist);
+}
+
+float RoundedCornerMask(float2 uv, float4 bounds, float radius, float fadeWidth) {
+  if (radius <= 0.00001)
+    return 1.0;
+
+  float2 innerMin = float2(bounds.x + radius, bounds.z + radius);
+  float2 innerMax = float2(bounds.y - radius, bounds.w - radius);
+
+  if ((uv.x >= innerMin.x && uv.x <= innerMax.x) ||
+      (uv.y >= innerMin.y && uv.y <= innerMax.y)) {
+    return 1.0;
+  }
+
+  float2 center = uv;
+
+  if (uv.x < innerMin.x && uv.y < innerMin.y)
+    center = innerMin;
+  else if (uv.x > innerMax.x && uv.y < innerMin.y)
+    center = float2(innerMax.x, innerMin.y);
+  else if (uv.x < innerMin.x && uv.y > innerMax.y)
+    center = float2(innerMin.x, innerMax.y);
+  else if (uv.x > innerMax.x && uv.y > innerMax.y)
+    center = innerMax;
+  else
+    return 1.0;
+
+  float d = distance(uv, center);
+
+  if (fadeWidth > 0.00001) {
+    return 1.0 - smoothstep(radius - fadeWidth, radius, d);
+  } else {
+    return d <= radius ? 1.0 : 0.0;
+  }
+}
+
+float ApplyCropMask(float2 uv) {
+  float4 bounds = Params6;
+  // Uninitialized / zero bounds would black the frame. Treat as no crop.
+  if (bounds.y <= bounds.x || bounds.w <= bounds.z)
+    return 1.0;
+
+  float cornerStyle = Params5.y;
+
+  float2 rectSize = float2(bounds.y - bounds.x, bounds.w - bounds.z);
+  float minRectSize = min(rectSize.x, rectSize.y);
+
+  float borderFade = Params5.x * minRectSize;
+  float cornerRadius = Params5.z * minRectSize * 0.5;
+
+  float alpha = FadeMask(uv, bounds, borderFade);
+
+if (cornerStyle > 0.5) {
+  float cornerAlpha = RoundedCornerMask(uv, bounds, cornerRadius, borderFade);
+  alpha = min(alpha, cornerAlpha);
+}
+
+return saturate(alpha);
+}
+
 float4 mainPostProcess(in float4 position : SV_POSITION, in float2 texcoord : TEXCOORD0) : SV_TARGET {
   float3 color = SAMPLE_TEXTURE(texcoord).rgb;
+  color = ApplyLumaSharpen(color, texcoord);
 
 #ifdef POST_PROCESS_SRC_SRGB
   color = srgb2linear(color);
@@ -186,7 +321,8 @@ float4 mainPostProcess(in float4 position : SV_POSITION, in float2 texcoord : TE
   color = linear2srgb(color);
 #endif
 
-  return float4(saturate(color), 1.0);
+  float alpha = ApplyCropMask(texcoord);
+  return float4(saturate(color) * alpha, 1.0);
 }
 
 float4 mainPassThrough(in float4 position : SV_POSITION, in float2 texcoord : TEXCOORD0) : SV_TARGET {
@@ -226,7 +362,10 @@ float4 mainPassThrough(in float4 position : SV_POSITION, in float2 texcoord : TE
 
 #endif
 
-  return float4(saturate(color), 1.0);
+  color = ApplyLumaSharpen(color, texcoord);
+
+  float alpha = ApplyCropMask(texcoord);
+  return float4(saturate(color) * alpha, 1.0);
 }
 
 // clang-format on

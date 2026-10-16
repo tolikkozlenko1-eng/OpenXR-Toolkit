@@ -118,14 +118,14 @@ $(SolutionDir)\installer\signtool.exe sign /d "OpenXR Toolkit" /du "https://mbuc
       </Message>
     </PreLinkEvent>
     <PreBuildEvent>
-      <Command>python $(ProjectDir)\framework\dispatch_generator.py
-if not exist $(SolutionDir)\version.info goto :skip_version
-for /f "delims== tokens=1,2" %%G in ($(SolutionDir)\version.info) do set %%G=%%H
-$(SolutionDir)\patches\sed.exe -i "s/const std::string LayerPrettyNameFull = \"OpenXR Toolkit - .*\";$/const std::string LayerPrettyNameFull = \"OpenXR Toolkit - %pretty_name% (v%major%.%minor%.%patch%)\";/g" $(ProjectDir)\layer.h
-$(SolutionDir)\patches\sed.exe -i "s/FILEVERSION .*$/FILEVERSION %major%,%minor%,%patch%,0/g" $(ProjectDir)\resource.rc
-$(SolutionDir)\patches\sed.exe -i "s/PRODUCTVERSION .*$/PRODUCTVERSION %major%,%minor%,%patch%,0/g" $(ProjectDir)\resource.rc
-$(SolutionDir)\patches\sed.exe -i "s/VALUE \"FileVersion\", \".*\"$/VALUE \"FileVersion\", \"%major%.%minor%.%patch%.0\"/g" $(ProjectDir)\resource.rc
-$(SolutionDir)\patches\sed.exe -i "s/VALUE \"ProductVersion\", \".*\"$/VALUE \"ProductVersion\", \"%major%.%minor%.%patch%.0\"/g" $(ProjectDir)\resource.rc
+      <Command>python "$(ProjectDir)framework\dispatch_generator.py"
+if not exist "$(SolutionDir)version.info" goto :skip_version
+for /f "usebackq delims== tokens=1,2" %%G in ("$(SolutionDir)version.info") do set %%G=%%H
+"$(SolutionDir)patches\sed.exe" -i "s/const std::string LayerPrettyNameFull = \"OpenXR Toolkit - .*\";$/const std::string LayerPrettyNameFull = \"OpenXR Toolkit - %pretty_name% (v%major%.%minor%.%patch%)\";/g" "$(ProjectDir)layer.h"
+"$(SolutionDir)patches\sed.exe" -i "s/FILEVERSION .*$/FILEVERSION %major%,%minor%,%patch%,0/g" "$(ProjectDir)resource.rc"
+"$(SolutionDir)patches\sed.exe" -i "s/PRODUCTVERSION .*$/PRODUCTVERSION %major%,%minor%,%patch%,0/g" "$(ProjectDir)resource.rc"
+"$(SolutionDir)patches\sed.exe" -i "s/VALUE \"FileVersion\", \".*\"$/VALUE \"FileVersion\", \"%major%.%minor%.%patch%.0\"/g" "$(ProjectDir)resource.rc"
+"$(SolutionDir)patches\sed.exe" -i "s/VALUE \"ProductVersion\", \".*\"$/VALUE \"ProductVersion\", \"%major%.%minor%.%patch%.0\"/g" "$(ProjectDir)resource.rc"
 :skip_version</Command>
     </PreBuildEvent>
     <PreBuildEvent>
@@ -198,14 +198,14 @@ $(SolutionDir)\installer\signtool.exe sign /d "OpenXR Toolkit" /du "https://mbuc
       </Message>
     </PreLinkEvent>
     <PreBuildEvent>
-      <Command>python $(ProjectDir)\framework\dispatch_generator.py
-if not exist $(SolutionDir)\version.info goto :skip_version
-for /f "delims== tokens=1,2" %%G in ($(SolutionDir)\version.info) do set %%G=%%H
-$(SolutionDir)\patches\sed.exe -i "s/const std::string LayerPrettyNameFull = \"OpenXR Toolkit - .*\";$/const std::string LayerPrettyNameFull = \"OpenXR Toolkit - %pretty_name% (v%major%.%minor%.%patch%)\";/g" $(ProjectDir)\layer.h
-$(SolutionDir)\patches\sed.exe -i "s/FILEVERSION .*$/FILEVERSION %major%,%minor%,%patch%,0/g" $(ProjectDir)\resource.rc
-$(SolutionDir)\patches\sed.exe -i "s/PRODUCTVERSION .*$/PRODUCTVERSION %major%,%minor%,%patch%,0/g" $(ProjectDir)\resource.rc
-$(SolutionDir)\patches\sed.exe -i "s/VALUE \"FileVersion\", \".*\"$/VALUE \"FileVersion\", \"%major%.%minor%.%patch%.0\"/g" $(ProjectDir)\resource.rc
-$(SolutionDir)\patches\sed.exe -i "s/VALUE \"ProductVersion\", \".*\"$/VALUE \"ProductVersion\", \"%major%.%minor%.%patch%.0\"/g" $(ProjectDir)\resource.rc
+      <Command>python "$(ProjectDir)framework\dispatch_generator.py"
+if not exist "$(SolutionDir)version.info" goto :skip_version
+for /f "usebackq delims== tokens=1,2" %%G in ("$(SolutionDir)version.info") do set %%G=%%H
+"$(SolutionDir)patches\sed.exe" -i "s/const std::string LayerPrettyNameFull = \"OpenXR Toolkit - .*\";$/const std::string LayerPrettyNameFull = \"OpenXR Toolkit - %pretty_name% (v%major%.%minor%.%patch%)\";/g" "$(ProjectDir)layer.h"
+"$(SolutionDir)patches\sed.exe" -i "s/FILEVERSION .*$/FILEVERSION %major%,%minor%,%patch%,0/g" "$(ProjectDir)resource.rc"
+"$(SolutionDir)patches\sed.exe" -i "s/PRODUCTVERSION .*$/PRODUCTVERSION %major%,%minor%,%patch%,0/g" "$(ProjectDir)resource.rc"
+"$(SolutionDir)patches\sed.exe" -i "s/VALUE \"FileVersion\", \".*\"$/VALUE \"FileVersion\", \"%major%.%minor%.%patch%.0\"/g" "$(ProjectDir)resource.rc"
+"$(SolutionDir)patches\sed.exe" -i "s/VALUE \"ProductVersion\", \".*\"$/VALUE \"ProductVersion\", \"%major%.%minor%.%patch%.0\"/g" "$(ProjectDir)resource.rc"
 :skip_version</Command>
     </PreBuildEvent>
     <PreBuildEvent>
