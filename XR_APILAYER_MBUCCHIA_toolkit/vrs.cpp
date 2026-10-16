@@ -23,6 +23,8 @@
 
 #include "pch.h"
 
+#include <algorithm>
+
 #include "shader_utilities.h"
 #include "factories.h"
 #include "interfaces.h"
@@ -315,6 +317,32 @@ namespace {
         }
 
         void endFrame() override {
+            const uint32_t markers = m_markerCount.exchange(0, std::memory_order_relaxed);
+            if (markers > m_markerPeak && m_markerFrameLogs < 3) {
+                m_markerPeak = markers;
+                Log("VRS markers kept full rate: %u\n", markers);
+                m_markerFrameLogs++;
+            }
+            const uint32_t overlays = m_overlayCount.exchange(0, std::memory_order_relaxed);
+            if (overlays > m_overlayPeak && m_overlayFrameLogs < 3) {
+                m_overlayPeak = overlays;
+                Log("VRS overlay full rate: %u\n", overlays);
+                m_overlayFrameLogs++;
+            }
+            const uint32_t applied = m_applyCount.load(std::memory_order_relaxed);
+            if (applied > m_applyPeak && m_applyLogs < 4) {
+                m_applyPeak = applied;
+                Log("VRS applied on %u draws (%u deferred) wide %ux%u\n",
+                    applied,
+                    m_applyDeferred.load(std::memory_order_relaxed),
+                    m_frameWideWidth,
+                    m_frameWideHeight);
+                m_applyLogs++;
+            }
+            m_applyCount.store(0, std::memory_order_relaxed);
+            m_applyDeferred.store(0, std::memory_order_relaxed);
+            logDrawSizes();
+
             {
                 // Find the most likely actual render resolution.
                 std::unique_lock lock(m_renderScalesLock);
@@ -351,6 +379,13 @@ namespace {
 
                 m_usingEyeTracking = usingEyeTracking;
 
+                if (usingEyeTracking && !m_loggedRings) {
+                    Log("VRS eye tracking mask on, inner radius %u, outer radius %u\n",
+                        m_configManager->getValue(SettingVRSInnerRadius),
+                        m_configManager->getValue(SettingVRSOuterRadius));
+                    m_loggedRings = true;
+                }
+
                 if (hasPatternChanged) {
                     updateRings(mode);
                     updateGaze();
@@ -380,6 +415,9 @@ namespace {
                                std::shared_ptr<ITexture> renderTarget,
                                std::optional<Eye> eyeHint) override {
             const auto& info = renderTarget->getInfo();
+            if (context) {
+                rememberSize(context->getNativePtr(), info.width, info.height);
+            }
 
             bool isDoubleWide = false;
             if (m_mode == VariableShadingRateType::None || !isVariableRateShadingCandidate(info, isDoubleWide)) {
@@ -406,7 +444,9 @@ namespace {
             }
 
             if (auto context11 = context->getAs<D3D11>()) {
-                if (m_currentState.isActive && m_currentState.width == info.width &&
+                // Eye tracking rewrites the mask every frame. Rebind so a driver that snapshots the
+                // shading-rate image at bind time cannot keep the first (centered) sample.
+                if (!m_usingEyeTracking && m_currentState.isActive && m_currentState.width == info.width &&
                     m_currentState.height == info.height && m_currentState.eye == eye) {
                     TraceLoggingWrite(g_traceProvider, "SkipEnableVariableRateShading", TLArg("AlreadySet", "Reason"));
                     return true;
@@ -418,13 +458,42 @@ namespace {
                 desc.version = NV_D3D11_VIEWPORTS_SHADING_RATE_DESC_VER;
                 desc.numViewports = (uint32_t)std::size(m_nvRates);
                 desc.pViewports = m_nvRates;
-                CHECK_NVCMD(NvAPI_D3D11_RSSetViewportsPixelShadingRates(context11, &desc));
+                m_currentState.isActive = true;
+                if (!checkNv(NvAPI_D3D11_RSSetViewportsPixelShadingRates(context11, &desc), "viewport rates")) {
+                    disable(context);
+                    return false;
+                }
 
                 auto& mask = isDoubleWide          ? m_NvShadingRateResources.viewsDoubleWide[maskIndex]
                              : info.arraySize == 2 ? m_NvShadingRateResources.viewsTextureArray[maskIndex]
                                                    : m_NvShadingRateResources.views[maskIndex][(size_t)eye];
 
-                CHECK_NVCMD(NvAPI_D3D11_RSSetShadingRateResourceView(context11, get(mask)));
+                ID3D11NvShadingRateResourceView* shadingView = get(mask);
+                if (!checkNv(NvAPI_D3D11_RSSetShadingRateResourceView(context11, shadingView), "shading view")) {
+                    disable(context);
+                    return false;
+                }
+
+                if (m_bindLogs < 3) {
+                    const auto& gaze = m_gazeLocation[std::min((size_t)eye, (size_t)ViewCount)];
+                    Log("VRS shading rate bound: %ux%u samples=%u eye=%u doubleWide=%d gaze=%.3f,%.3f\n",
+                        info.width,
+                        info.height,
+                        info.sampleCount,
+                        (unsigned)eye,
+                        isDoubleWide ? 1 : 0,
+                        gaze.x,
+                        gaze.y);
+                    m_bindLogs++;
+                }
+                markContext(context->getNativePtr(), true);
+                // The bind above can be dropped before Draw. Remember the view and latch it again on the draw.
+                noteShadingView(context->getNativePtr(), shadingView);
+                // Do not remember this bind. The driver drops it before Draw, and a remembered
+                // bind makes the draw hook skip the one rebind that carries the new gaze.
+                m_frameWideView = shadingView;
+                m_frameWideWidth = info.width;
+                m_frameWideHeight = info.height;
 
                 doCapture(/* post */);
                 doCapture(renderTarget, eyeHint);
@@ -460,7 +529,333 @@ namespace {
         }
 
         void onUnsetRenderTarget(std::shared_ptr<graphics::IContext> context) override {
+            if (context) {
+                rememberSize(context->getNativePtr(), 0, 0);
+            }
             disable(context);
+        }
+
+        void onSetViewports(std::shared_ptr<graphics::IContext> context) override {
+            if (!context || !isContextActive(context->getNativePtr())) {
+                return;
+            }
+
+            auto context11 = context->getAs<D3D11>();
+            if (!context11) {
+                return;
+            }
+
+            // RSSetViewports drops the shading-rate image. Put it back once here.
+            // Draws keep that bind until the next viewport change or a full-rate label.
+            reapplyContext(context11, context->getNativePtr());
+        }
+
+        void onBeforeExecute(void* native) override {
+            (void)native;
+        }
+
+        bool isHudMarker(ID3D11DeviceContext* context, uint32_t primitiveCount) const {
+            // Station and star names, and the lock ring, are small blended draws.
+            // A fullscreen pass samples the eye-sized picture. World meshes write depth.
+            if (!context || primitiveCount == 0 || primitiveCount > 12000u) {
+                return false;
+            }
+
+            ID3D11BlendState* blend = nullptr;
+            FLOAT factor[4] = {};
+            UINT sampleMask = 0;
+            context->OMGetBlendState(&blend, factor, &sampleMask);
+            bool blends = false;
+            if (blend) {
+                D3D11_BLEND_DESC desc{};
+                blend->GetDesc(&desc);
+                blends = desc.RenderTarget[0].BlendEnable != FALSE;
+                blend->Release();
+            }
+            if (!blends) {
+                return false;
+            }
+
+            ID3D11DepthStencilState* depth = nullptr;
+            UINT stencilRef = 0;
+            context->OMGetDepthStencilState(&depth, &stencilRef);
+            if (!depth) {
+                return false;
+            }
+            D3D11_DEPTH_STENCIL_DESC depthDesc{};
+            depth->GetDesc(&depthDesc);
+            depth->Release();
+            if (depthDesc.DepthWriteMask != D3D11_DEPTH_WRITE_MASK_ZERO) {
+                return false;
+            }
+
+            bool sawSrv = false;
+            bool sawEyeSized = false;
+            bool sawSmall = false;
+            for (UINT slot = 0; slot < 4; ++slot) {
+                ID3D11ShaderResourceView* srv = nullptr;
+                context->PSGetShaderResources(slot, 1, &srv);
+                if (!srv) {
+                    continue;
+                }
+                sawSrv = true;
+                ID3D11Resource* resource = nullptr;
+                srv->GetResource(&resource);
+                srv->Release();
+                if (!resource) {
+                    continue;
+                }
+                ID3D11Texture2D* texture = nullptr;
+                if (SUCCEEDED(resource->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&texture))) &&
+                    texture) {
+                    D3D11_TEXTURE2D_DESC textureDesc{};
+                    texture->GetDesc(&textureDesc);
+                    texture->Release();
+                    const bool eyeSized = (m_renderWidth >= 1500 && textureDesc.Width >= (m_renderWidth * 9u / 10u)) ||
+                                          (m_renderHeight >= 1500 && textureDesc.Height >= (m_renderHeight * 9u / 10u));
+                    if (eyeSized) {
+                        sawEyeSized = true;
+                    } else if (textureDesc.Width <= 2048 && textureDesc.Height <= 2048 && textureDesc.Width > 0) {
+                        sawSmall = true;
+                    }
+                }
+                resource->Release();
+                if (sawEyeSized) {
+                    break;
+                }
+            }
+            if (sawEyeSized) {
+                return false;
+            }
+            if (sawSmall) {
+                return true;
+            }
+            // A lock ring drawn as lines, with no texture. A fullscreen triangle has 3 vertices.
+            return !sawSrv && primitiveCount >= 12u;
+        }
+
+        bool isEyeSizedTexture(uint32_t width, uint32_t height) const {
+            return (m_renderWidth >= 1500 && width >= (m_renderWidth * 9u / 10u)) ||
+                   (m_renderHeight >= 1500 && height >= (m_renderHeight * 9u / 10u));
+        }
+
+        // OpenComposite names Elite `OpenComposite_EliteDangerous64`. Native OpenXR
+        // would be `EliteDangerous64`. Other titles must not inherit this HUD match.
+        bool isEliteApplication() const {
+            const auto& name = m_openXR.GetApplicationName();
+            return name.find("EliteDangerous") != std::string::npos;
+        }
+
+        // Elite builds the station panel and the open menu sharp, offscreen, then
+        // copies them into the eye with one draw. Supercruise names and the circles
+        // around them are vector draws into the eye. Both land outside the inner
+        // disk, so the outer 1/16 shades the whole label. The create-time shader
+        // hash never sees them: they already exist when the hook is installed.
+        bool isEliteOverlay(ID3D11DeviceContext* context,
+                            uint32_t primitiveCount,
+                            void* shader,
+                            uint32_t& texWidth,
+                            uint32_t& texHeight,
+                            uint32_t& path) {
+            texWidth = 0;
+            texHeight = 0;
+            path = 0;
+            (void)shader;
+            if (!context || primitiveCount == 0 || primitiveCount > 12000u) {
+                return false;
+            }
+
+            // Depth write does not disqualify these. The flight HUD and the
+            // panel copy write depth, and treating that as "world" threw the
+            // name and the menu out on the 19:18 flight.
+            ID3D11DepthStencilState* depth = nullptr;
+            UINT stencilRef = 0;
+            context->OMGetDepthStencilState(&depth, &stencilRef);
+            bool writesDepth = true;
+            if (depth) {
+                D3D11_DEPTH_STENCIL_DESC depthDesc{};
+                depth->GetDesc(&depthDesc);
+                depth->Release();
+                writesDepth = depthDesc.DepthWriteMask != D3D11_DEPTH_WRITE_MASK_ZERO;
+            }
+
+            bool sawSrv = false;
+            bool sawEye = false;
+            uint32_t maxSide = 0;
+            for (UINT slot = 0; slot < 8; ++slot) {
+                ID3D11ShaderResourceView* srv = nullptr;
+                context->PSGetShaderResources(slot, 1, &srv);
+                if (!srv) {
+                    continue;
+                }
+                ID3D11Resource* resource = nullptr;
+                srv->GetResource(&resource);
+                srv->Release();
+                if (!resource) {
+                    continue;
+                }
+                ID3D11Texture2D* texture = nullptr;
+                if (SUCCEEDED(resource->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&texture))) &&
+                    texture) {
+                    D3D11_TEXTURE2D_DESC textureDesc{};
+                    texture->GetDesc(&textureDesc);
+                    texture->Release();
+                    sawSrv = true;
+                    const uint32_t side = std::max(textureDesc.Width, textureDesc.Height);
+                    if (side >= maxSide) {
+                        maxSide = side;
+                        texWidth = textureDesc.Width;
+                        texHeight = textureDesc.Height;
+                    }
+                    if (isEyeSizedTexture(textureDesc.Width, textureDesc.Height)) {
+                        sawEye = true;
+                    }
+                }
+                resource->Release();
+            }
+            if (sawEye) {
+                return false;
+            }
+            // Names and circles are vector strokes. No picture is sampled.
+            if (!sawSrv && primitiveCount >= 12u) {
+                path = 3;
+                return true;
+            }
+            if (!sawSrv) {
+                return false;
+            }
+
+            // One panel quad, or one glyph repeated as instances.
+            if (primitiveCount <= 96u && maxSide >= 64u && maxSide <= 8192u) {
+                path = 1;
+                return true;
+            }
+            // A larger HUD batch that does not write the scene depth.
+            if (!writesDepth && primitiveCount >= 12u && maxSide <= 4096u) {
+                path = 4;
+                return true;
+            }
+            // The cockpit holo mesh samples a surface about 0.45 by 0.37 of the eye.
+            if (m_renderWidth > 0 && m_renderHeight > 0) {
+                const float fx = static_cast<float>(texWidth) / static_cast<float>(m_renderWidth);
+                const float fy = static_cast<float>(texHeight) / static_cast<float>(m_renderHeight);
+                if (fx >= 0.28f && fx <= 0.75f && fy >= 0.22f && fy <= 0.70f) {
+                    path = 2;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        void onBeforeDraw(void* native, uint32_t primitiveCount) override {
+            if (!native || m_device->getApi() != Api::D3D11) {
+                return;
+            }
+            countDraw(native);
+            // Bind the mask that matches this draw's target. A mask left over from the
+            // previous size is ignored by the driver, and the lens stays full resolution.
+            uint32_t width = 0;
+            uint32_t height = 0;
+            if (!recallSize(native, width, height)) {
+                return;
+            }
+            bool isDoubleWide = false;
+            if (!isFoveatedSize(width, height, isDoubleWide)) {
+                return;
+            }
+            auto context11 = static_cast<ID3D11DeviceContext*>(native);
+            // The immediate context keeps a shading-rate bind until the target changes,
+            // a viewport call drops it, or a label needs full rate. Rebinding on every
+            // rock is what the asteroid belt was paying for. Deferred lists still bind
+            // per draw, because FinishCommandList can throw their state away.
+            const bool immediate = native == m_device->getContextPtr();
+            auto bindRates = [&](bool enable, ID3D11NvShadingRateResourceView* view) {
+                ID3D11NvShadingRateResourceView* key = enable ? view : nullptr;
+                const uint32_t keyW = enable ? width : 0u;
+                const uint32_t keyH = enable ? height : 0u;
+                if (immediate && drawBindMatches(native, key, keyW, keyH)) {
+                    if (!m_loggedRateKeep) {
+                        Log("VRS rate kept across draws\n");
+                        m_loggedRateKeep = true;
+                    }
+                    return;
+                }
+                applyShadingRates(context11, enable, key);
+                if (immediate) {
+                    rememberDrawBind(native, key, keyW, keyH);
+                }
+                m_applyCount.fetch_add(1, std::memory_order_relaxed);
+                if (!immediate) {
+                    m_applyDeferred.fetch_add(1, std::memory_order_relaxed);
+                }
+            };
+            // The outer 1/16 ring is what blocks station names, the lock ring, and the
+            // part of a panel that sits outside the inner disk. Those draws use four
+            // known vertex shaders. Unbind the shading-rate image for that draw only.
+            // The next world draw binds it again. A miss leaves that one piece blocky.
+            // HUD matching is Elite-only so other OpenComposite titles keep the circle.
+            if (isEliteApplication()) {
+                ID3D11VertexShader* uiShader = nullptr;
+                context11->VSGetShader(&uiShader, nullptr, nullptr);
+                if (uiShader) {
+                    uint64_t uiHash = 0;
+                    bool logDraw = false;
+                    const bool ui = matchEliteUiVertexShader(uiShader, uiHash, logDraw);
+                    if (ui) {
+                        uiShader->Release();
+                        bindRates(false, nullptr);
+                        if (logDraw) {
+                            Log("VRS UI full rate %016llx\n", uiHash);
+                        }
+                        return;
+                    }
+                    uint32_t texWidth = 0;
+                    uint32_t texHeight = 0;
+                    uint32_t path = 0;
+                    const bool overlay =
+                        isEliteOverlay(context11, primitiveCount, uiShader, texWidth, texHeight, path);
+                    uiShader->Release();
+                    if (overlay) {
+                        bindRates(false, nullptr);
+                        m_overlayCount.fetch_add(1, std::memory_order_relaxed);
+                        if (m_overlayLogs < 10) {
+                            Log("VRS overlay full rate path=%u prims=%u tex=%ux%u\n",
+                                path,
+                                primitiveCount,
+                                texWidth,
+                                texHeight);
+                            m_overlayLogs++;
+                        }
+                        return;
+                    }
+                }
+                if (isHudMarker(context11, primitiveCount)) {
+                    bindRates(false, nullptr);
+                    const uint32_t kept = m_markerCount.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (m_markerLogs < 4 && kept <= 4) {
+                        Log("VRS marker full rate prims=%u\n", primitiveCount);
+                        m_markerLogs++;
+                    }
+                    return;
+                }
+            }
+            ID3D11NvShadingRateResourceView* view = nullptr;
+            if (!lookupShadingView(width, height, isDoubleWide, view) || !view) {
+                noteDrawRate(width, height, false);
+                if (isContextActive(native)) {
+                    bindRates(false, nullptr);
+                }
+                return;
+            }
+            bindRates(true, view);
+            noteShadingView(native, view);
+            markContext(native, true);
+            noteDrawRate(width, height, true);
+            if (!m_loggedLatch) {
+                const bool deferred = native != m_device->getContextPtr();
+                Log("VRS latched before draw (%s)\n", deferred ? "deferred" : "immediate");
+                m_loggedLatch = true;
+            }
         }
 
         void updateGazeLocation(XrVector2f gaze, Eye eye) override {
@@ -580,22 +975,42 @@ namespace {
         void disable(std::shared_ptr<graphics::IContext> context = nullptr) {
             TraceLoggingWrite(g_traceProvider, "DisableVariableRateShading");
             if (m_device->getApi() == Api::D3D11) {
-                if (!m_currentState.isActive) {
-                    TraceLoggingWrite(g_traceProvider, "SkipDisableVariableRateShading");
+                // numViewports == 0 is device-global: it turns VRS off on every context, including the
+                // scene pass that was just enabled. Shut this context off only.
+                if (!context) {
+                    std::vector<void*> natives;
+                    {
+                        std::unique_lock lock(m_vrsContextLock);
+                        natives.swap(m_vrsContexts);
+                        m_vrsLatch.clear();
+                        m_drawBind.clear();
+                    }
+                    m_device->clearPendingVrsLatch();
+                    m_frameWideView = nullptr;
+                    m_frameWideWidth = 0;
+                    m_frameWideHeight = 0;
+                    for (void* native : natives) {
+                        applyShadingRates(static_cast<ID3D11DeviceContext*>(native), false, nullptr);
+                    }
+                    doCapture(/* post */);
+                    m_currentState.isActive = false;
                     return;
                 }
 
-                auto context11 = context ? context->getAs<D3D11>() : m_device->getContextAs<D3D11>();
-
-                NV_D3D11_VIEWPORTS_SHADING_RATE_DESC desc;
-                ZeroMemory(&desc, sizeof(desc));
-                desc.version = NV_D3D11_VIEWPORTS_SHADING_RATE_DESC_VER;
-                CHECK_NVCMD(NvAPI_D3D11_RSSetViewportsPixelShadingRates(context11, &desc));
-                CHECK_NVCMD(NvAPI_D3D11_RSSetShadingRateResourceView(context11, nullptr));
-
+                void* native = context->getNativePtr();
+                if (!isContextActive(native)) {
+                    TraceLoggingWrite(g_traceProvider, "SkipDisableVariableRateShading");
+                    return;
+                }
+                markContext(native, false);
+                applyShadingRates(context->getAs<D3D11>(), false, nullptr);
                 doCapture(/* post */);
-
-                m_currentState.isActive = false;
+                {
+                    std::unique_lock lock(m_vrsContextLock);
+                    if (m_vrsContexts.empty()) {
+                        m_currentState.isActive = false;
+                    }
+                }
             } else if (m_device->getApi() == Api::D3D12) {
                 auto context12 = context ? context->getAs<D3D12>() : m_device->getContextAs<D3D12>();
 
@@ -725,7 +1140,8 @@ namespace {
             XrVector2f gaze[ViewCount];
             // We've determined experimentally that +4% offset gives best results.
             float xOffset = m_gazeOffset[2].x + 0.04f;
-            if (!m_usingEyeTracking || !m_eyeTracker || !m_eyeTracker->getProjectedGaze(gaze)) {
+            const bool haveGaze = m_usingEyeTracking && m_eyeTracker && m_eyeTracker->getProjectedGaze(gaze);
+            if (!haveGaze) {
                 gaze[0] = m_gazeOffset[0];
                 gaze[1] = m_gazeOffset[1];
             }
@@ -733,9 +1149,16 @@ namespace {
             m_gazeLocation[0] = gaze[0] + XrVector2f{xOffset, m_gazeOffset[2].y};
             m_gazeLocation[1] = gaze[1] + XrVector2f{-xOffset, m_gazeOffset[2].y};
 
-            // The generic mask only supports vertical offsets.
-            m_gazeLocation[2].x = 0;
-            m_gazeLocation[2].y = m_gazeOffset[2].y;
+            if (haveGaze) {
+                // OpenComposite does not tag which eye a render target belongs to, so the single
+                // mask has to carry a binocular point. Horizontal gaze must not be dropped.
+                m_gazeLocation[2].x = (m_gazeLocation[0].x + m_gazeLocation[1].x) * 0.5f;
+                m_gazeLocation[2].y = (m_gazeLocation[0].y + m_gazeLocation[1].y) * 0.5f;
+            } else {
+                // The fixed pattern's generic mask only supports vertical offsets.
+                m_gazeLocation[2].x = 0;
+                m_gazeLocation[2].y = m_gazeOffset[2].y;
+            }
         }
 
         bool getMaskIndex(uint32_t width, uint32_t height, size_t& index) {
@@ -878,8 +1301,10 @@ namespace {
                 size_t eye = i;
                 ShadingConstants constants;
                 if (m_usingEyeTracking) {
-                    // The combined mask has both eyes.
-                    eye = eye % 2;
+                    // 0/1 are the per-eye masks. OpenComposite does not tag eyes, so the untagged
+                    // mask is the one every Elite draw uses. One circle at the binocular point.
+                    // Painting both eyes into that mask made a small overlap between them.
+                    eye = (i >= ViewCount) ? ViewCount : i;
                 }
                 constants = makeShadingConstants(eye, mask.widthInTiles, mask.heightInTiles);
                 mask.cbShading[i]->uploadData(&constants, sizeof(constants));
@@ -916,6 +1341,8 @@ namespace {
             for (size_t i = 0; i < std::size(mask.mask); i++) {
                 mask.mask[i]->setState(D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE);
             }
+
+            sampleMaskOnce(mask);
 
             TraceLoggingWriteStop(local, "VariableRateShading_UpdateMask");
         }
@@ -1004,6 +1431,382 @@ namespace {
             }
         }
 
+        bool checkNv(NvAPI_Status status, const char* what) {
+            if (status == NVAPI_OK) {
+                return true;
+            }
+            if (!m_loggedNvFail) {
+                Log("VRS NVAPI failed (%s): %x\n", what, (unsigned)status);
+                m_loggedNvFail = true;
+            }
+            return false;
+        }
+
+        struct VrsLatchState {
+            void* native{nullptr};
+            ID3D11NvShadingRateResourceView* view{nullptr};
+            bool dirty{false};
+        };
+
+        struct DrawBindState {
+            void* native{nullptr};
+            ID3D11NvShadingRateResourceView* view{nullptr};
+            uint32_t width{0};
+            uint32_t height{0};
+            uint64_t gen{0};
+        };
+
+        bool drawBindMatches(void* native,
+                             ID3D11NvShadingRateResourceView* view,
+                             uint32_t width,
+                             uint32_t height) {
+            std::unique_lock lock(m_vrsContextLock);
+            for (const auto& state : m_drawBind) {
+                if (state.native == native) {
+                    // Same view pointer across frames still points at a mask the gaze pass rewrote.
+                    // The driver snapshots that image at bind time, so a new frame has to bind once.
+                    return state.view == view && state.width == width && state.height == height &&
+                           state.gen == m_currentGen;
+                }
+            }
+            return false;
+        }
+
+        void rememberDrawBind(void* native,
+                              ID3D11NvShadingRateResourceView* view,
+                              uint32_t width,
+                              uint32_t height) {
+            if (!native) {
+                return;
+            }
+            std::unique_lock lock(m_vrsContextLock);
+            for (auto& state : m_drawBind) {
+                if (state.native == native) {
+                    state.view = view;
+                    state.width = width;
+                    state.height = height;
+                    state.gen = m_currentGen;
+                    return;
+                }
+            }
+            m_drawBind.push_back({native, view, width, height, m_currentGen});
+        }
+
+        void noteShadingView(void* native, ID3D11NvShadingRateResourceView* view) {
+            if (!native || !view) {
+                return;
+            }
+            std::unique_lock lock(m_vrsContextLock);
+            auto it = std::find_if(m_vrsLatch.begin(), m_vrsLatch.end(), [&](const VrsLatchState& state) {
+                return state.native == native;
+            });
+            if (it == m_vrsLatch.end()) {
+                m_vrsLatch.push_back({native, view, true});
+            } else {
+                it->view = view;
+                it->dirty = true;
+            }
+            m_device->setPendingVrsLatch();
+        }
+
+        struct DrawSizeCount {
+            uint32_t width{0};
+            uint32_t height{0};
+            uint32_t draws{0};
+            uint32_t deferred{0};
+        };
+
+        struct LastRt {
+            void* native{nullptr};
+            uint32_t width{0};
+            uint32_t height{0};
+        };
+
+        bool recallSize(void* native, uint32_t& width, uint32_t& height) {
+            width = 0;
+            height = 0;
+            if (!native) {
+                return false;
+            }
+            std::unique_lock lock(m_vrsContextLock);
+            for (const auto& rt : m_lastRt) {
+                if (rt.native == native) {
+                    width = rt.width;
+                    height = rt.height;
+                    return width != 0 && height != 0;
+                }
+            }
+            return false;
+        }
+
+        void rememberSize(void* native, uint32_t width, uint32_t height) {
+            if (!native) {
+                return;
+            }
+            std::unique_lock lock(m_vrsContextLock);
+            for (auto& rt : m_lastRt) {
+                if (rt.native == native) {
+                    rt.width = width;
+                    rt.height = height;
+                    return;
+                }
+            }
+            m_lastRt.push_back({native, width, height});
+        }
+
+        void countDraw(void* native) {
+            uint32_t width = 0;
+            uint32_t height = 0;
+            bool found = false;
+            {
+                std::unique_lock lock(m_vrsContextLock);
+                for (const auto& rt : m_lastRt) {
+                    if (rt.native == native) {
+                        width = rt.width;
+                        height = rt.height;
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if (!found) {
+                m_drawSizeOther++;
+                return;
+            }
+            const bool deferred = native != m_device->getContextPtr();
+            int freeSlot = -1;
+            for (int i = 0; i < (int)std::size(m_drawSizes); i++) {
+                if (m_drawSizes[i].draws > 0 && m_drawSizes[i].width == width && m_drawSizes[i].height == height) {
+                    m_drawSizes[i].draws++;
+                    if (deferred) {
+                        m_drawSizes[i].deferred++;
+                    }
+                    return;
+                }
+                if (m_drawSizes[i].draws == 0 && freeSlot < 0) {
+                    freeSlot = i;
+                }
+            }
+            if (freeSlot >= 0) {
+                m_drawSizes[freeSlot] = {width, height, 1u, deferred ? 1u : 0u};
+            } else {
+                m_drawSizeOther++;
+            }
+        }
+
+        void logDrawSizes() {
+            uint32_t total = m_drawSizeOther;
+            for (const auto& slot : m_drawSizes) {
+                total += slot.draws;
+            }
+            if (total > m_peakDraws && m_sizeLogs < 3) {
+                m_peakDraws = total;
+                char line[320] = {};
+                for (const auto& slot : m_drawSizes) {
+                    if (!slot.draws) {
+                        continue;
+                    }
+                    char piece[64];
+                    sprintf_s(piece, " %ux%u=%u/%u", slot.width, slot.height, slot.draws, slot.deferred);
+                    strcat_s(line, piece);
+                }
+                Log("VRS draw sizes%s other=%u\n", line, m_drawSizeOther);
+                m_sizeLogs++;
+            } else if (total > m_peakDraws) {
+                m_peakDraws = total;
+            }
+            for (auto& slot : m_drawSizes) {
+                slot = {};
+            }
+            m_drawSizeOther = 0;
+        }
+
+        bool isFoveatedSize(uint32_t width, uint32_t height, bool& isDoubleWide) const {
+            isDoubleWide = false;
+            if (!width || !height || m_renderWidth < 1500) {
+                return false;
+            }
+            const float aspectRatio = (float)width / (float)height;
+            const float halfAspect = (float)(width / 2) / (float)height;
+            isDoubleWide = std::abs(halfAspect - m_renderRatio) <= 0.01f;
+            if (isDoubleWide) {
+                return width / 2 >= (uint32_t)(m_actualRenderWidth * m_filterScale);
+            }
+            const float viewAspect = 16.f / 9.f;
+            const bool wideEnough = height >= 1500 && width >= (m_renderWidth * 9u / 10u);
+            const bool isView = wideEnough && std::abs(aspectRatio - viewAspect) < 0.05f;
+            const bool isEye = m_renderHeight >= 1500 && width >= (m_renderWidth * 9u / 10u) &&
+                               height >= (m_renderHeight * 9u / 10u);
+            return isView || isEye;
+        }
+
+        bool lookupShadingView(uint32_t width,
+                               uint32_t height,
+                               bool isDoubleWide,
+                               ID3D11NvShadingRateResourceView*& out) {
+            size_t maskIndex = 0;
+            {
+                std::unique_lock lock(m_shadingRateMaskLock);
+                if (!getMaskIndex(isDoubleWide ? width / 2 : width, height, maskIndex)) {
+                    return false;
+                }
+                m_shadingRateMask[maskIndex].age = 0;
+            }
+            auto& mask = isDoubleWide ? m_NvShadingRateResources.viewsDoubleWide[maskIndex]
+                                      : m_NvShadingRateResources.views[maskIndex][(size_t)Eye::Both];
+            out = get(mask);
+            return out != nullptr;
+        }
+
+        void noteDrawRate(uint32_t width, uint32_t height, bool ready) {
+            if (m_drawRateLogs >= std::size(m_drawRateKeys)) {
+                return;
+            }
+            const uint64_t key = ((uint64_t)width << 32 | height) ^ (ready ? 0ull : 0x8000000000000000ull);
+            for (uint32_t i = 0; i < m_drawRateLogs; i++) {
+                if (m_drawRateKeys[i] == key) {
+                    return;
+                }
+            }
+            m_drawRateKeys[m_drawRateLogs++] = key;
+            Log(ready ? "VRS draw-time rate %ux%u\n" : "VRS draw-time no mask %ux%u\n", width, height);
+        }
+
+        bool reapplyContext(ID3D11DeviceContext* context11, void* native) {
+            if (!context11 || !native) {
+                return false;
+            }
+            ID3D11NvShadingRateResourceView* view = nullptr;
+            {
+                std::unique_lock lock(m_vrsContextLock);
+                if (std::find(m_vrsContexts.begin(), m_vrsContexts.end(), native) == m_vrsContexts.end()) {
+                    return false;
+                }
+                auto it = std::find_if(m_vrsLatch.begin(), m_vrsLatch.end(), [&](const VrsLatchState& state) {
+                    return state.native == native;
+                });
+                if (it == m_vrsLatch.end() || !it->view) {
+                    return false;
+                }
+                view = it->view;
+            }
+            applyShadingRates(context11, true, view);
+            uint32_t width = 0;
+            uint32_t height = 0;
+            recallSize(native, width, height);
+            rememberDrawBind(native, view, width, height);
+            return true;
+        }
+
+        void applyShadingRates(ID3D11DeviceContext* context11, bool enable, ID3D11NvShadingRateResourceView* view) {
+            if (!context11) {
+                return;
+            }
+
+            NV_D3D11_VIEWPORT_SHADING_RATE_DESC offRates[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+            NV_D3D11_VIEWPORT_SHADING_RATE_DESC* rates = m_nvRates;
+            if (!enable) {
+                for (size_t i = 0; i < std::size(offRates); i++) {
+                    offRates[i] = m_nvRates[i];
+                    offRates[i].enableVariablePixelShadingRate = false;
+                }
+                rates = offRates;
+            }
+
+            NV_D3D11_VIEWPORTS_SHADING_RATE_DESC desc;
+            ZeroMemory(&desc, sizeof(desc));
+            desc.version = NV_D3D11_VIEWPORTS_SHADING_RATE_DESC_VER;
+            desc.numViewports = (uint32_t)std::size(m_nvRates);
+            desc.pViewports = rates;
+            checkNv(NvAPI_D3D11_RSSetViewportsPixelShadingRates(context11, &desc),
+                    enable ? "viewport rates" : "clear viewport rates");
+            checkNv(NvAPI_D3D11_RSSetShadingRateResourceView(context11, enable ? view : nullptr),
+                    enable ? "shading view" : "clear shading view");
+        }
+
+        void sampleMaskOnce(ShadingRateMask& mask) {
+            if (m_loggedMaskSample || m_device->getApi() != Api::D3D11) {
+                return;
+            }
+            auto texture = mask.mask[ViewCount]->getAs<D3D11>();
+            auto context11 = m_device->getContextAs<D3D11>();
+            if (!texture || !context11 || mask.widthInTiles == 0 || mask.heightInTiles == 0) {
+                return;
+            }
+
+            D3D11_TEXTURE2D_DESC desc;
+            texture->GetDesc(&desc);
+            desc.Usage = D3D11_USAGE_STAGING;
+            desc.BindFlags = 0;
+            desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            desc.MiscFlags = 0;
+            ComPtr<ID3D11Texture2D> staging;
+            if (FAILED(m_device->getAs<D3D11>()->CreateTexture2D(&desc, nullptr, set(staging)))) {
+                Log("VRS mask sample failed\n");
+                m_loggedMaskSample = true;
+                return;
+            }
+
+            context11->CopyResource(get(staging), texture);
+            context11->Flush();
+            D3D11_MAPPED_SUBRESOURCE mapped{};
+            if (FAILED(context11->Map(get(staging), 0, D3D11_MAP_READ, 0, &mapped)) || !mapped.pData) {
+                Log("VRS mask sample failed\n");
+                m_loggedMaskSample = true;
+                return;
+            }
+            const auto* rows = static_cast<const uint8_t*>(mapped.pData);
+            const uint32_t cx = desc.Width / 2;
+            const uint32_t cy = desc.Height / 2;
+            const uint32_t center = rows[(size_t)cy * mapped.RowPitch + cx];
+            const uint32_t corner = rows[0];
+            context11->Unmap(get(staging), 0);
+            Log("VRS mask sample center %u corner %u (rates %u %u %u)\n",
+                center,
+                corner,
+                m_Rates[ViewCount][0],
+                m_Rates[ViewCount][1],
+                m_Rates[ViewCount][2]);
+            m_loggedMaskSample = true;
+        }
+
+        void markContext(void* native, bool active) {
+            if (!native) {
+                return;
+            }
+            std::unique_lock lock(m_vrsContextLock);
+            const auto it = std::find(m_vrsContexts.begin(), m_vrsContexts.end(), native);
+            if (active) {
+                if (it == m_vrsContexts.end()) {
+                    m_vrsContexts.push_back(native);
+                }
+                m_device->setPendingVrsLatch();
+            } else if (it != m_vrsContexts.end()) {
+                m_vrsContexts.erase(it);
+            }
+            if (!active) {
+                m_vrsLatch.erase(std::remove_if(m_vrsLatch.begin(),
+                                                m_vrsLatch.end(),
+                                                [&](const VrsLatchState& state) { return state.native == native; }),
+                                 m_vrsLatch.end());
+                m_drawBind.erase(std::remove_if(m_drawBind.begin(),
+                                                m_drawBind.end(),
+                                                [&](const DrawBindState& state) { return state.native == native; }),
+                                 m_drawBind.end());
+                if (m_vrsContexts.empty()) {
+                    m_device->clearPendingVrsLatch();
+                }
+            }
+        }
+
+        bool isContextActive(void* native) {
+            if (!native) {
+                return false;
+            }
+            std::unique_lock lock(m_vrsContextLock);
+            return std::find(m_vrsContexts.begin(), m_vrsContexts.end(), native) != m_vrsContexts.end();
+        }
+
         bool isVariableRateShadingCandidate(const XrSwapchainCreateInfo& info, bool& isDoubleWide) {
             TraceLoggingWrite(g_traceProvider,
                               "IsVariableRateShadingCandidate",
@@ -1015,6 +1818,19 @@ namespace {
             const float aspectRatio = (float)info.width / info.height;
             const float aspectRatioWidthDiv2 = (float)(info.width / 2) / info.height;
             isDoubleWide = std::abs(aspectRatioWidthDiv2 - m_renderRatio) <= 0.01f;
+
+            const auto reject = [&](const char* why) {
+                if (m_rejectLogs < 6 && info.width >= 256 && info.height >= 256) {
+                    Log("VRS target skipped: %ux%u samples=%u array=%u (%s)\n",
+                        info.width,
+                        info.height,
+                        info.sampleCount,
+                        info.arraySize,
+                        why);
+                    m_rejectLogs++;
+                }
+                return false;
+            };
 
             const auto trackRenderScale = [&](const uint32_t width) {
                 // Ignore things that are definitely too low. We use DLSS's Ultra Performance (33%) as our lower bound.
@@ -1033,26 +1849,38 @@ namespace {
             };
 
             if (!isDoubleWide) {
-                if (std::abs(aspectRatio - m_renderRatio) > 0.01f) {
-                    return false;
+                // 4540x2553 is the wide picture. 4500x4500 is the square eye picture.
+                // 5259x4500 is the color target created once the ship is up; its aspect is
+                // about 1.17, so a square-only test never shaded it and the lens stayed full rate.
+                const float viewAspect = 16.f / 9.f;
+                const bool eyeWide = m_renderWidth >= 1500 && info.height >= 1500 &&
+                                     info.width >= (m_renderWidth * 9u / 10u);
+                const bool isView = eyeWide && std::abs(aspectRatio - viewAspect) < 0.05f;
+                const bool isEye = m_renderWidth >= 1500 && m_renderHeight >= 1500 &&
+                                   info.width >= (m_renderWidth * 9u / 10u) &&
+                                   info.height >= (m_renderHeight * 9u / 10u);
+                if (!isView && !isEye) {
+                    return reject(std::abs(aspectRatio - m_renderRatio) > 0.01f ? "aspect" : "small");
+                }
+                if (isEye && m_eyeLogs < 4) {
+                    Log("VRS eye target accepted: %ux%u\n", info.width, info.height);
+                    m_eyeLogs++;
+                } else if (isView && m_wideLogs < 4) {
+                    Log("VRS wide target accepted: %ux%u\n", info.width, info.height);
+                    m_wideLogs++;
                 }
 
                 trackRenderScale(info.width);
 
-                // Check for proportionality with the size of our render target.
-                if (info.width < (m_actualRenderWidth * m_filterScale)) {
-                    return false;
-                }
-
                 if (info.arraySize > 2) {
-                    return false;
+                    return reject("array");
                 }
             } else {
                 trackRenderScale(info.width / 2);
 
                 // Check for proportionality with the size of our render target.
                 if (info.width / 2 < (m_actualRenderWidth * m_filterScale)) {
-                    return false;
+                    return reject("small");
                 }
             }
 
@@ -1088,6 +1916,45 @@ namespace {
             uint32_t height;
             Eye eye;
         } m_currentState;
+
+        std::vector<void*> m_vrsContexts;
+        std::vector<VrsLatchState> m_vrsLatch;
+        std::vector<DrawBindState> m_drawBind;
+        bool m_loggedRateKeep{false};
+        std::mutex m_vrsContextLock;
+        uint32_t m_bindLogs{0};
+        uint32_t m_rejectLogs{0};
+        bool m_loggedNvFail{false};
+        bool m_loggedRings{false};
+        bool m_loggedLatch{false};
+        bool m_loggedExecute{false};
+        bool m_loggedMaskSample{false};
+        ID3D11NvShadingRateResourceView* m_frameWideView{nullptr};
+        uint32_t m_frameWideWidth{0};
+        uint32_t m_frameWideHeight{0};
+        uint32_t m_applyPeak{0};
+        uint32_t m_applyLogs{0};
+        std::atomic<uint32_t> m_applyCount{0};
+        std::atomic<uint32_t> m_applyDeferred{0};
+        uint32_t m_wideLogs{0};
+        uint32_t m_eyeLogs{0};
+        uint32_t m_drawRateLogs{0};
+        uint64_t m_drawRateKeys[6]{};
+        std::atomic<uint32_t> m_markerCount{0};
+        uint32_t m_markerLogs{0};
+        uint32_t m_markerFrameLogs{0};
+        uint32_t m_markerPeak{0};
+        std::mutex m_overlayLock;
+        std::map<void*, uint8_t> m_worldVs;
+        std::atomic<uint32_t> m_overlayCount{0};
+        uint32_t m_overlayLogs{0};
+        uint32_t m_overlayFrameLogs{0};
+        uint32_t m_overlayPeak{0};
+        uint32_t m_sizeLogs{0};
+        uint32_t m_peakDraws{0};
+        uint32_t m_drawSizeOther{0};
+        DrawSizeCount m_drawSizes[8]{};
+        std::vector<LastRt> m_lastRt;
 
         // The current "generation" of the mask parameters.
         uint64_t m_currentGen{0};
@@ -1154,6 +2021,92 @@ namespace {
 #endif
 
 namespace toolkit::graphics {
+    namespace {
+
+        // EDVR watches these on game build 332841. They are FNV-1a 64 of the whole
+        // CreateVertexShader bytecode (3DMigoto FNV), not a prefix.
+        constexpr uint64_t kEliteUiVs[] = {
+            0xB7790CBFC6554097ull, // vector HUD: names, rings, brackets, flight readout
+            0xE508648660A352B2ull, // target / lock indicator quad
+            0x5DA53D8B0133341Eull, // HUD icon quad
+            0x81216C77F90DEDD6ull, // holo panel composite (the menu)
+        };
+
+        std::mutex g_eliteUiLock;
+        std::map<void*, uint64_t> g_eliteUiVs;
+        bool g_eliteUiCreateLogged[std::size(kEliteUiVs)]{};
+        bool g_eliteUiDrawLogged[std::size(kEliteUiVs)]{};
+
+        uint64_t fnv1a64(const void* data, size_t length) {
+            const auto* bytes = static_cast<const uint8_t*>(data);
+            uint64_t hash = 0xcbf29ce484222325ull;
+            for (size_t i = 0; i < length; ++i) {
+                hash ^= bytes[i];
+                hash *= 0x100000001b3ull;
+            }
+            return hash;
+        }
+
+        int eliteUiIndex(uint64_t hash) {
+            for (size_t i = 0; i < std::size(kEliteUiVs); ++i) {
+                if (hash == kEliteUiVs[i]) {
+                    return static_cast<int>(i);
+                }
+            }
+            return -1;
+        }
+
+    } // namespace
+
+    void noteEliteUiVertexShader(void* shader, const void* bytecode, size_t length) {
+        if (!shader || !bytecode || length == 0) {
+            return;
+        }
+        try {
+            const uint64_t hash = fnv1a64(bytecode, length);
+            const int index = eliteUiIndex(hash);
+            if (index < 0) {
+                return;
+            }
+            bool logCreate = false;
+            {
+                std::lock_guard<std::mutex> lock(g_eliteUiLock);
+                g_eliteUiVs[shader] = hash;
+                if (!g_eliteUiCreateLogged[index]) {
+                    g_eliteUiCreateLogged[index] = true;
+                    logCreate = true;
+                }
+            }
+            if (logCreate) {
+                toolkit::log::Log("VRS UI shader created %016llx\n", hash);
+            }
+        } catch (...) {
+        }
+    }
+
+    bool matchEliteUiVertexShader(void* shader, uint64_t& hash, bool& logDraw) {
+        logDraw = false;
+        if (!shader) {
+            return false;
+        }
+        try {
+            std::lock_guard<std::mutex> lock(g_eliteUiLock);
+            const auto it = g_eliteUiVs.find(shader);
+            if (it == g_eliteUiVs.end()) {
+                return false;
+            }
+            hash = it->second;
+            const int index = eliteUiIndex(hash);
+            if (index >= 0 && !g_eliteUiDrawLogged[index]) {
+                g_eliteUiDrawLogged[index] = true;
+                logDraw = true;
+            }
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
     std::shared_ptr<IVariableRateShader> CreateVariableRateShader(OpenXrApi& openXR,
                                                                   std::shared_ptr<IConfigManager> configManager,
                                                                   std::shared_ptr<IDevice> graphicsDevice,
