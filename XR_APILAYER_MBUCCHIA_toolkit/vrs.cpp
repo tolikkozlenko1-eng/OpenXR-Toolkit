@@ -639,18 +639,11 @@ namespace {
                    (m_renderHeight >= 1500 && height >= (m_renderHeight * 9u / 10u));
         }
 
-        // OpenComposite names Elite `OpenComposite_EliteDangerous64`. Native OpenXR
-        // would be `EliteDangerous64`. Other titles must not inherit this HUD match.
-        bool isEliteApplication() const {
-            const auto& name = m_openXR.GetApplicationName();
-            return name.find("EliteDangerous") != std::string::npos;
-        }
-
-        // Elite builds the station panel and the open menu sharp, offscreen, then
-        // copies them into the eye with one draw. Supercruise names and the circles
-        // around them are vector draws into the eye. Both land outside the inner
-        // disk, so the outer 1/16 shades the whole label. The create-time shader
-        // hash never sees them: they already exist when the hook is installed.
+        // Panels and menus are drawn sharp offscreen, then copied into the eye with
+        // one draw. Names and the circles around them are vector draws into the eye.
+        // Both land outside the inner disk, so the outer 1/16 shades the whole label.
+        // The create-time shader hash never sees them: they already exist when the
+        // hook is installed. This match runs for every OpenComposite title.
         bool isEliteOverlay(ID3D11DeviceContext* context,
                             uint32_t primitiveCount,
                             void* shader,
@@ -789,55 +782,51 @@ namespace {
                     m_applyDeferred.fetch_add(1, std::memory_order_relaxed);
                 }
             };
-            // The outer 1/16 ring is what blocks station names, the lock ring, and the
-            // part of a panel that sits outside the inner disk. Those draws use four
-            // known vertex shaders. Unbind the shading-rate image for that draw only.
+            // The outer 1/16 ring blocks labels, menus, and markers that sit outside
+            // the inner disk. Unbind the shading-rate image for that draw only.
             // The next world draw binds it again. A miss leaves that one piece blocky.
-            // HUD matching is Elite-only so other OpenComposite titles keep the circle.
-            if (isEliteApplication()) {
-                ID3D11VertexShader* uiShader = nullptr;
-                context11->VSGetShader(&uiShader, nullptr, nullptr);
-                if (uiShader) {
-                    uint64_t uiHash = 0;
-                    bool logDraw = false;
-                    const bool ui = matchEliteUiVertexShader(uiShader, uiHash, logDraw);
-                    if (ui) {
-                        uiShader->Release();
-                        bindRates(false, nullptr);
-                        if (logDraw) {
-                            Log("VRS UI full rate %016llx\n", uiHash);
-                        }
-                        return;
-                    }
-                    uint32_t texWidth = 0;
-                    uint32_t texHeight = 0;
-                    uint32_t path = 0;
-                    const bool overlay =
-                        isEliteOverlay(context11, primitiveCount, uiShader, texWidth, texHeight, path);
+            ID3D11VertexShader* uiShader = nullptr;
+            context11->VSGetShader(&uiShader, nullptr, nullptr);
+            if (uiShader) {
+                uint64_t uiHash = 0;
+                bool logDraw = false;
+                const bool ui = matchEliteUiVertexShader(uiShader, uiHash, logDraw);
+                if (ui) {
                     uiShader->Release();
-                    if (overlay) {
-                        bindRates(false, nullptr);
-                        m_overlayCount.fetch_add(1, std::memory_order_relaxed);
-                        if (m_overlayLogs < 10) {
-                            Log("VRS overlay full rate path=%u prims=%u tex=%ux%u\n",
-                                path,
-                                primitiveCount,
-                                texWidth,
-                                texHeight);
-                            m_overlayLogs++;
-                        }
-                        return;
-                    }
-                }
-                if (isHudMarker(context11, primitiveCount)) {
                     bindRates(false, nullptr);
-                    const uint32_t kept = m_markerCount.fetch_add(1, std::memory_order_relaxed) + 1;
-                    if (m_markerLogs < 4 && kept <= 4) {
-                        Log("VRS marker full rate prims=%u\n", primitiveCount);
-                        m_markerLogs++;
+                    if (logDraw) {
+                        Log("VRS UI full rate %016llx\n", uiHash);
                     }
                     return;
                 }
+                uint32_t texWidth = 0;
+                uint32_t texHeight = 0;
+                uint32_t path = 0;
+                const bool overlay =
+                    isEliteOverlay(context11, primitiveCount, uiShader, texWidth, texHeight, path);
+                uiShader->Release();
+                if (overlay) {
+                    bindRates(false, nullptr);
+                    m_overlayCount.fetch_add(1, std::memory_order_relaxed);
+                    if (m_overlayLogs < 10) {
+                        Log("VRS overlay full rate path=%u prims=%u tex=%ux%u\n",
+                            path,
+                            primitiveCount,
+                            texWidth,
+                            texHeight);
+                        m_overlayLogs++;
+                    }
+                    return;
+                }
+            }
+            if (isHudMarker(context11, primitiveCount)) {
+                bindRates(false, nullptr);
+                const uint32_t kept = m_markerCount.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (m_markerLogs < 4 && kept <= 4) {
+                    Log("VRS marker full rate prims=%u\n", primitiveCount);
+                    m_markerLogs++;
+                }
+                return;
             }
             ID3D11NvShadingRateResourceView* view = nullptr;
             if (!lookupShadingView(width, height, isDoubleWide, view) || !view) {
