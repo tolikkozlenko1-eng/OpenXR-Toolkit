@@ -4,11 +4,10 @@ This branch is the **buildable source** for [OpenComposite DFR](https://github.c
 
 What this branch adds on top of Matthieu Bucchianeri's Toolkit:
 
-- One eye-tracked foveation circle for OpenComposite games that draw each eye as its own picture. That path is meant to work universally on those titles
-- Tested in Elite Dangerous (with EDVR) and Skyrim VR
-- Exception: games like Fallout 4 VR, which render stereo ass-backwards as one wide side-by-side picture. Leave foveation off for that kind of game
+- One eye-tracked foveation circle for OpenComposite games. The circle works universally on those titles
+- A game that draws each eye as its own picture gets the circle on that picture
+- A game that draws both eyes into one wide side-by-side picture gets a circle in each half, when each half matches the per-eye aspect
 - NVIDIA D3D11 variable rate shading (inner disk full rate, outside 1/16)
-- Elite overlay, name, menu, and marker full-rate matching, gated to application names that contain `EliteDangerous`. Other games keep the gaze circle
 
 Install like Primashock: replace `C:\Program Files\OpenXR-Toolkit\XR_APILAYER_MBUCCHIA_toolkit.dll` while the game is closed. Do not copy someone else's registry. See the [landing repo README](https://github.com/tolikkozlenko1-eng/opencomposite-dfr) for the full install notes.
 
